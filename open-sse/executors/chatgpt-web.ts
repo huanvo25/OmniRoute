@@ -1528,7 +1528,10 @@ type ImageResolver = (
  * "no image was produced". Escalated mesh report: image visible in the ChatGPT
  * chat but returned to OmniRoute as a bare "completed without image markdown".
  */
-export function detectImageResolutionFailure(pointerCount: number, resolvedCount: number): boolean {
+export function detectImageResolutionFailure(
+  pointerCount: number,
+  resolvedCount: number
+): boolean {
   return pointerCount > 0 && resolvedCount === 0;
 }
 
