@@ -16,9 +16,8 @@ import { join } from "node:path";
 process.env.DATA_DIR = mkdtempSync(join(tmpdir(), "omniroute-cgptweb-silentdrop-"));
 
 const { detectImageResolutionFailure } = await import("../../open-sse/executors/chatgpt-web.ts");
-const { handleChatGptWebImageGeneration } = await import(
-  "../../open-sse/handlers/imageGeneration/providers/chatgptWeb.ts"
-);
+const { handleChatGptWebImageGeneration } =
+  await import("../../open-sse/handlers/imageGeneration/providers/chatgptWeb.ts");
 
 function fakeExecutor(jsonBody: object, status = 200) {
   return {
@@ -93,4 +92,57 @@ test("handler returns success when the executor produced image markdown", async 
   assert.equal(res.success, true);
   assert.equal(res.data.data.length, 1);
   assert.equal(res.data.data[0].url, url);
+});
+
+test("handler forwards image_url and image_urls as data-URL message attachments", async () => {
+  const url = "/v1/chatgpt-web/image/abcdef0123456789";
+  let request: { body?: { messages?: Array<{ content?: unknown }> } } | null = null;
+  const res = await handleChatGptWebImageGeneration({
+    ...baseArgs,
+    body: {
+      prompt: "use both references",
+      image_url: "data:image/png;base64,iVBORw0KGgo=",
+      image_urls: ["data:image/jpeg;base64,/9j/4AAQSkY="],
+    },
+    executorFactory: () => ({
+      execute: async (input) => {
+        request = input;
+        return {
+          response: new Response(
+            JSON.stringify({
+              choices: [{ message: { role: "assistant", content: `![image](${url})` } }],
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } }
+          ),
+        };
+      },
+    }),
+  });
+  assert.equal(res.success, true);
+  const content = request?.body?.messages?.[0]?.content;
+  assert.ok(Array.isArray(content));
+  assert.equal(content[0].type, "text");
+  assert.match(content[0].text, /attached reference image/i);
+  assert.deepEqual(
+    content.slice(1).map((part) => part.image_url.url),
+    ["data:image/png;base64,iVBORw0KGgo=", "data:image/jpeg;base64,/9j/4AAQSkY="]
+  );
+});
+
+test("handler rejects non-data-URL references before starting a ChatGPT session", async () => {
+  let called = false;
+  const res = await handleChatGptWebImageGeneration({
+    ...baseArgs,
+    body: { prompt: "use reference", image_url: "https://example.com/reference.png" },
+    executorFactory: () => ({
+      execute: async () => {
+        called = true;
+        throw new Error("should not run");
+      },
+    }),
+  });
+  assert.equal(res.success, false);
+  assert.equal(res.status, 400);
+  assert.match(res.error, /base64 data URLs/i);
+  assert.equal(called, false);
 });
