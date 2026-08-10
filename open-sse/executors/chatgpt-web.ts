@@ -1035,7 +1035,11 @@ async function uploadReferenceImages(
       throw new ReferenceImageUploadError("ChatGPT Web could not prepare a reference image upload");
     }
 
-    let registrationBody: { file_id?: unknown; upload_url?: unknown };
+    let registrationBody: {
+      file_id?: unknown;
+      upload_url?: unknown;
+      upload_headers?: unknown;
+    };
     try {
       registrationBody = JSON.parse(registration.text || "{}");
     } catch {
@@ -1052,11 +1056,23 @@ async function uploadReferenceImages(
       );
     }
 
+    // Some ChatGPT upload backends return signed headers (for example
+    // x-amz-* values) alongside the pre-signed URL. Omitting them makes the
+    // otherwise valid PUT fail with a signature mismatch. Keep only simple
+    // string pairs so an unexpected registration payload cannot inject a
+    // malformed fetch header.
+    const uploadHeaders: Record<string, string> = {};
+    if (registrationBody.upload_headers && typeof registrationBody.upload_headers === "object") {
+      for (const [key, value] of Object.entries(registrationBody.upload_headers)) {
+        if (typeof value === "string") uploadHeaders[key] = value;
+      }
+    }
+
     let putResponse: Response;
     try {
       putResponse = await fetch(uploadUrl, {
         method: "PUT",
-        headers: { "Content-Type": image.mimeType },
+        headers: { ...uploadHeaders, "Content-Type": image.mimeType },
         body: image.bytes,
         signal: signal ?? undefined,
       });
@@ -2910,9 +2926,10 @@ async function pollForAsyncImage(
         const message = node?.message;
         const parts = message?.content?.parts;
         if (!Array.isArray(parts)) continue;
-        const pointers = extractImagePointers(parts).map(
-          (pointer) => ({ pointer, messageId: message?.id })
-        );
+        const pointers = extractImagePointers(parts).map((pointer) => ({
+          pointer,
+          messageId: message?.id,
+        }));
         if (pointers.length === 0) continue;
         const at = message?.create_time ?? 0;
         if (!newest || at >= newest.at) newest = { pointers, at };
