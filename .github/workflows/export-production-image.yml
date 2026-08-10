@@ -1,0 +1,47 @@
+name: Export production image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build linux amd64 image archive
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build immutable runtime image archive
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: runner-base
+          platforms: linux/amd64
+          build-args: |
+            OMNIROUTE_BUILD_MEMORY_MB=4096
+          outputs: type=docker,dest=/tmp/omniroute-linux-amd64.tar
+          tags: omniroute:cb932d78c-v3849-chatgpt-web
+          cache-from: type=gha,scope=omniroute-production-amd64
+          cache-to: type=gha,scope=omniroute-production-amd64,mode=max
+
+      - name: Record image checksum
+        run: sha256sum /tmp/omniroute-linux-amd64.tar > /tmp/omniroute-linux-amd64.tar.sha256
+
+      - name: Upload deploy artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: omniroute-linux-amd64-cb932d78c
+          path: |
+            /tmp/omniroute-linux-amd64.tar
+            /tmp/omniroute-linux-amd64.tar.sha256
+          if-no-files-found: error
+          retention-days: 2
