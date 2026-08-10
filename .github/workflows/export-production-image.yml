@@ -1,6 +1,9 @@
 name: Export production image
 
 on:
+  push:
+    branches:
+      - release/v3849-chatgpt-web
   workflow_dispatch:
 
 permissions:
