@@ -83,7 +83,8 @@ RUN --mount=type=cache,id=npm-cache,target=/root/.npm \
   && node -e "require('better-sqlite3')(':memory:').close()" \
   && node node_modules/tls-client-node/scripts/postinstall.js \
   && (test -n "$(find node_modules/tls-client-node/bin -mindepth 1 -print -quit 2>/dev/null)" \
-      || (echo "tls-client-node native binary missing after postinstall — GitHub API fetch likely rate-limited or failed (#7802)" >&2 && exit 1))
+      || (echo "tls-client-node native binary missing after postinstall — GitHub API fetch likely rate-limited or failed (#7802)" >&2 && exit 1)) \
+  && node -e "const fs=require('node:fs');const path=require('node:path');const root='node_modules/tls-client-node/bin';const files=fs.readdirSync(root).map(f=>path.join(root,f));const so=files.find(f=>f.endsWith('.so'));if(!so)throw new Error('tls-client-node Linux shared library missing');const st=fs.statSync(so);const magic=Buffer.alloc(4);const fd=fs.openSync(so,'r');fs.readSync(fd,magic,0,4,0);fs.closeSync(fd);if(st.size<=1024*1024||!magic.equals(Buffer.from([0x7f,0x45,0x4c,0x46])))throw new Error('tls-client-node Linux shared library is truncated or not ELF')"
 
 # Build with Turbopack (stable in Next 16, the repo default). The v3.8.27-era
 # TurbopackInternalError panic ("entered unreachable code: there must be a path to a
@@ -160,6 +161,10 @@ COPY --from=builder /app/.build/next/standalone ./
 # Next.js tracing. bootstrap-env requires SQLite BEFORE the standalone server
 # starts, so guarantee the complete package independent of trace behaviour.
 COPY --from=builder /app/node_modules/better-sqlite3 ./node_modules/better-sqlite3
+# tls-client-node downloads its native Linux shared library during the builder
+# stage. Next standalone tracing does not reliably retain this runtime-loaded
+# directory, so copy it explicitly and keep the production image self-contained.
+COPY --from=builder /app/node_modules/tls-client-node/bin ./node_modules/tls-client-node/bin
 # migrations land at <standalone>/migrations via assembleStandalone; point the runtime at them.
 ENV OMNIROUTE_MIGRATIONS_DIR=/app/migrations
 

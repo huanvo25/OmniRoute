@@ -32,7 +32,7 @@ jobs:
           build-args: |
             OMNIROUTE_BUILD_MEMORY_MB=4096
           outputs: type=docker,dest=/tmp/omniroute-linux-amd64.tar
-          tags: omniroute:cb932d78c-v3849-chatgpt-web
+          tags: omniroute:${{ github.sha }}-v3849-chatgpt-web
           cache-from: type=gha,scope=omniroute-production-amd64
           cache-to: type=gha,scope=omniroute-production-amd64,mode=max
 
@@ -42,7 +42,7 @@ jobs:
       - name: Upload deploy artifact
         uses: actions/upload-artifact@v7
         with:
-          name: omniroute-linux-amd64-cb932d78c
+          name: omniroute-linux-amd64-${{ github.sha }}
           path: |
             /tmp/omniroute-linux-amd64.tar
             /tmp/omniroute-linux-amd64.tar.sha256

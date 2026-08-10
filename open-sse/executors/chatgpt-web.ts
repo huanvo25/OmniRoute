@@ -1061,18 +1061,34 @@ async function uploadReferenceImages(
     // otherwise valid PUT fail with a signature mismatch. Keep only simple
     // string pairs so an unexpected registration payload cannot inject a
     // malformed fetch header.
-    const uploadHeaders: Record<string, string> = {};
+    const uploadHeaders = new Headers();
     if (registrationBody.upload_headers && typeof registrationBody.upload_headers === "object") {
       for (const [key, value] of Object.entries(registrationBody.upload_headers)) {
-        if (typeof value === "string") uploadHeaders[key] = value;
+        if (typeof value === "string") uploadHeaders.set(key, value);
       }
+    }
+    if (!uploadHeaders.has("content-type")) {
+      uploadHeaders.set("content-type", image.mimeType);
+    }
+    // ChatGPT currently returns Azure Blob Storage signed URLs. Add the
+    // required Azure contract only when the registration response did not
+    // provide a signed value of its own. Headers handles names
+    // case-insensitively, avoiding duplicate lower/upper-case variants.
+    if (!uploadHeaders.has("x-ms-blob-type")) {
+      uploadHeaders.set("x-ms-blob-type", "BlockBlob");
+    }
+    if (!uploadHeaders.has("x-ms-version")) {
+      uploadHeaders.set("x-ms-version", "2020-04-08");
+    }
+    if (!uploadHeaders.has("content-length")) {
+      uploadHeaders.set("content-length", String(image.bytes.length));
     }
 
     let putResponse: Response;
     try {
       putResponse = await fetch(uploadUrl, {
         method: "PUT",
-        headers: { ...uploadHeaders, "Content-Type": image.mimeType },
+        headers: uploadHeaders,
         body: image.bytes,
         signal: signal ?? undefined,
       });

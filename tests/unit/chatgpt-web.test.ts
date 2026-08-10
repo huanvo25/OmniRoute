@@ -82,6 +82,7 @@ type MockFetchOptions = {
   conversationDetail?: MockTlsConfig | MockTlsConfig[];
   signedDownload?: MockTlsConfig;
   userConfig?: MockTlsConfig;
+  referenceUploadHeaders?: Record<string, string>;
   onSession?: (opts: TlsFetchOptions) => void;
   onSentinel?: (opts: TlsFetchOptions) => void;
   onConv?: (opts: TlsFetchOptions) => void;
@@ -119,6 +120,7 @@ function installMockFetch({
   conversationDetail,
   signedDownload,
   userConfig,
+  referenceUploadHeaders,
   onSession,
   onSentinel,
   onConv,
@@ -229,6 +231,7 @@ function installMockFetch({
         text: JSON.stringify({
           file_id: "file-reference-1",
           upload_url: "https://uploads.example.test/reference-1",
+          ...(referenceUploadHeaders ? { upload_headers: referenceUploadHeaders } : {}),
         }),
         body: null,
       };
@@ -3124,13 +3127,25 @@ test("Reference images are uploaded and forwarded as ChatGPT multimodal attachme
   reset();
   const m = installMockFetch();
   const originalFetch = globalThis.fetch;
-  const uploads: Array<{ url: string; method: string; contentType: string | null; bytes: number }> =
-    [];
+  const uploads: Array<{
+    url: string;
+    method: string;
+    contentType: string | null;
+    blobType: string | null;
+    msVersion: string | null;
+    contentLength: string | null;
+    signedHeader: string | null;
+    bytes: number;
+  }> = [];
   globalThis.fetch = async (url, options = {}) => {
     uploads.push({
       url: String(url),
       method: String(options.method || "GET"),
       contentType: new Headers(options.headers).get("content-type"),
+      blobType: new Headers(options.headers).get("x-ms-blob-type"),
+      msVersion: new Headers(options.headers).get("x-ms-version"),
+      contentLength: new Headers(options.headers).get("content-length"),
+      signedHeader: new Headers(options.headers).get("x-signed-upload"),
       bytes: Buffer.isBuffer(options.body) ? options.body.length : 0,
     });
     return new Response(null, { status: 200 });
@@ -3171,6 +3186,10 @@ test("Reference images are uploaded and forwarded as ChatGPT multimodal attachme
         url: "https://uploads.example.test/reference-1",
         method: "PUT",
         contentType: "image/png",
+        blobType: "BlockBlob",
+        msVersion: "2020-04-08",
+        contentLength: String(png.length),
+        signedHeader: null,
         bytes: png.length,
       },
     ]);
@@ -3201,6 +3220,64 @@ test("Reference images are uploaded and forwarded as ChatGPT multimodal attachme
       width: 2,
       height: 3,
     });
+  } finally {
+    globalThis.fetch = originalFetch;
+    m.restore();
+  }
+});
+
+test("Reference image upload preserves signed headers case-insensitively", async () => {
+  reset();
+  const m = installMockFetch({
+    referenceUploadHeaders: {
+      "content-type": "image/png; signed=1",
+      "X-MS-BLOB-TYPE": "SignedBlockBlob",
+      "x-ms-version": "2099-01-01",
+      "Content-Length": "777",
+      "X-Signed-Upload": "keep-me",
+    },
+  });
+  const originalFetch = globalThis.fetch;
+  let capturedHeaders = new Headers();
+  globalThis.fetch = async (_url, options = {}) => {
+    capturedHeaders = new Headers(options.headers);
+    return new Response(null, { status: 200 });
+  };
+  const png = Buffer.from([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03,
+  ]);
+
+  try {
+    const executor = new ChatGptWebExecutor();
+    const result = await executor.execute({
+      model: "gpt-5.3-instant",
+      body: {
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "Create an image using this reference" },
+              {
+                type: "image_url",
+                image_url: { url: `data:image/png;base64,${png.toString("base64")}` },
+              },
+            ],
+          },
+        ],
+      },
+      stream: false,
+      credentials: { apiKey: "test" },
+      signal: AbortSignal.timeout(10_000),
+      log: null,
+    });
+
+    assert.equal(result.response.status, 200);
+    assert.equal(capturedHeaders.get("content-type"), "image/png; signed=1");
+    assert.equal(capturedHeaders.get("x-ms-blob-type"), "SignedBlockBlob");
+    assert.equal(capturedHeaders.get("x-ms-version"), "2099-01-01");
+    assert.equal(capturedHeaders.get("content-length"), "777");
+    assert.equal(capturedHeaders.get("x-signed-upload"), "keep-me");
   } finally {
     globalThis.fetch = originalFetch;
     m.restore();
