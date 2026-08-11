@@ -9,9 +9,8 @@
  *   2. Imports `maskEmailLikeValue` (or `pickDisplayValue`) from the mask utility
  *   3. References `emailsVisible` in its body
  *
- * Also verifies the email-privacy control is consolidated into Settings → Appearance
- * (#3822: the per-page toggle was removed in favor of a single global switch) while
- * QuotaSharePageClient still consumes the store for masking.
+ * The store now enforces full email visibility globally, while these components
+ * retain the shared display helpers for consistent account labels.
  */
 
 import test from "node:test";
@@ -36,21 +35,15 @@ const poolCardSrc = readSrc(`${quotaShareDir}/components/PoolCard.tsx`);
 const accountQuotaRowSrc = readSrc(`${quotaShareDir}/components/AccountQuotaRow.tsx`);
 const poolWizardSrc = readSrc(`${quotaShareDir}/components/PoolWizard.tsx`);
 
-const settingsDir = "src/app/(dashboard)/dashboard/settings/components";
-const appearanceTabSrc = readSrc(`${settingsDir}/AppearanceTab.tsx`);
-const accountEmailVisibilitySrc = readSrc(`${settingsDir}/AccountEmailVisibilitySetting.tsx`);
+// ── Global always-visible policy ──────────────────────────────────────────────
 
-// ── Global consolidation (#3822) ──────────────────────────────────────────────
-
-test("email-privacy control is consolidated into Settings → Appearance (#3822)", () => {
-  assert.ok(
-    appearanceTabSrc.includes("AccountEmailVisibilitySetting"),
-    "Expected AppearanceTab to render the global AccountEmailVisibilitySetting"
+test("Settings does not offer a control that can hide account emails", () => {
+  const appearanceTabSrc = readSrc(
+    "src/app/(dashboard)/dashboard/settings/components/AppearanceTab.tsx"
   );
   assert.ok(
-    accountEmailVisibilitySrc.includes("setEmailsVisible") &&
-      accountEmailVisibilitySrc.includes("useEmailPrivacyStore"),
-    "Expected the global setting to drive emailsVisible via the store"
+    !appearanceTabSrc.includes("AccountEmailVisibilitySetting"),
+    "Appearance settings must not provide a way to mask account emails"
   );
 });
 

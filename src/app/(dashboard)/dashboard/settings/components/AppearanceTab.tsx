@@ -13,7 +13,6 @@ import {
   type ComboConfigMode,
 } from "@/shared/constants/comboConfigMode";
 import { PIN_PROVIDER_QUOTA_TO_HOME_KEY } from "@/shared/constants/homeWidgets";
-import AccountEmailVisibilitySetting from "./AccountEmailVisibilitySetting";
 
 export default function AppearanceTab() {
   const { theme, setTheme, isDark } = useTheme();
@@ -455,8 +454,6 @@ export default function AppearanceTab() {
             </div>
           </div>
         </div>
-
-        <AccountEmailVisibilitySetting />
 
         <div className="pt-4 border-t border-border">
           <div className="flex items-center justify-between">

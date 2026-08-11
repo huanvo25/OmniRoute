@@ -1,25 +1,18 @@
-"use client";
-
 import { create } from "zustand";
-import { persist } from "zustand/middleware";
 
 interface EmailPrivacyState {
-  /** When true, all email addresses are shown in full (unmasked). Default: false (masked). */
-  emailsVisible: boolean;
-  /** Set the global email visibility state. */
-  setEmailsVisible: (visible: boolean) => void;
+  /** Account emails are always shown in full throughout the dashboard. */
+  readonly emailsVisible: true;
 }
 
-const useEmailPrivacyStore = create<EmailPrivacyState>()(
-  persist(
-    (set) => ({
-      emailsVisible: false,
-      setEmailsVisible: (visible) => set({ emailsVisible: visible }),
-    }),
-    {
-      name: "omniroute-email-privacy",
-    }
-  )
-);
+/**
+ * Account identities must remain visible in every dashboard surface.
+ *
+ * This intentionally does not persist the former masking preference, so a
+ * previously saved `omniroute-email-privacy` value cannot re-enable masking.
+ */
+const useEmailPrivacyStore = create<EmailPrivacyState>()(() => ({
+  emailsVisible: true,
+}));
 
 export default useEmailPrivacyStore;

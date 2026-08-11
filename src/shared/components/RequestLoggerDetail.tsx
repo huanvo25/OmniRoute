@@ -171,7 +171,7 @@ export default function RequestLoggerDetail({
   detail,
   loading,
   debugEnabled,
-  emailsVisible = false,
+  emailsVisible = true,
   onClose,
   onCopy,
   onPrevious,
