@@ -2851,6 +2851,17 @@ async function waitForImageViaWebSocket(
           conversation_id: innerPayload?.conversation_id as string | undefined,
         });
       }
+      // Some ChatGPT deployments deliver completed tool messages through the
+      // plural update_content.messages[] envelope instead of message.
+      for (const entry of Array.isArray(updateContent?.messages) ? updateContent.messages : []) {
+        const wrapped = (entry as { message?: unknown } | undefined)?.message;
+        if (wrapped) {
+          candidates.push({
+            message: wrapped as ChatGptStreamEvent["message"],
+            conversation_id: innerPayload?.conversation_id as string | undefined,
+          });
+        }
+      }
       if (innerPayload?.message) {
         candidates.push({
           message: innerPayload.message as ChatGptStreamEvent["message"],
@@ -2934,7 +2945,7 @@ async function pollForAsyncImage(
           : `WebSocket re-registration failed on retry attempt ${attempt + 1}`
       );
       if (attempt === 0) continue; // try again — registration can be flaky
-      return [];
+      break; // fall through to authenticated conversation polling
     }
     ctx.log?.debug?.(
       "CGPT-WEB",
@@ -2946,11 +2957,44 @@ async function pollForAsyncImage(
     // Only retry when the connection died before producing anything useful.
     // A clean close with no pointers (e.g., upstream cancellation) shouldn't
     // burn a second attempt — the result would be the same.
-    if (!outcome.errored || outcome.gotAnyMessage) return [];
+    if (!outcome.errored || outcome.gotAnyMessage) break;
     ctx.log?.warn?.(
       "CGPT-WEB",
       `WebSocket attempt ${attempt + 1} ended in transport error before any frame; retrying`
     );
+  }
+
+  // The celsius WebSocket is not reliable on every server network/TLS path.
+  // The generated image still lands in the durable conversation, so recover
+  // its newest pointer through the authenticated HTTP conversation endpoint.
+  // This is retrieval-only and can never create a duplicate image turn.
+  const pollDeadline = Math.max(deadline, Date.now() + 60_000);
+  while (Date.now() < pollDeadline && !ctx.signal?.aborted) {
+    const { detail } = await fetchConversationDetail(conversationId, ctx);
+    const mapping = detail?.mapping;
+    if (mapping) {
+      let newest: { pointers: ImagePointerRef[]; at: number } | null = null;
+      for (const node of Object.values(mapping)) {
+        const message = node?.message;
+        const parts = message?.content?.parts;
+        if (!Array.isArray(parts)) continue;
+        const pointers = extractImagePointers(parts).map((pointer) => ({
+          pointer,
+          messageId: message?.id,
+        }));
+        if (pointers.length === 0) continue;
+        const at = message?.create_time ?? 0;
+        if (!newest || at >= newest.at) newest = { pointers, at };
+      }
+      if (newest) {
+        ctx.log?.info?.(
+          "CGPT-WEB",
+          `Recovered ${newest.pointers.length} image pointer(s) via conversation poll (websocket yielded none)`
+        );
+        return newest.pointers;
+      }
+    }
+    await delayWithAbort(3_000, ctx.signal);
   }
   return [];
 }
