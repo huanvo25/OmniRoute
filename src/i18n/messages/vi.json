@@ -7373,7 +7373,7 @@
     "upstream": "Upstream",
     "semanticCacheHit": "Semantic cache hit (served by OmniRoute)",
     "upstreamResponse": "Upstream provider response",
-    "noApiKey": "No API key",
+    "noApiKey": "Ẩn danh / không có API key",
     "requestedRoutedTitle": "Requested {requested}, routed as {routed}",
     "statusFilters": {
       "all": "All",
@@ -7389,13 +7389,13 @@
       "provider": "Provider",
       "protocol": "Request Protocol",
       "account": "Account",
-      "apiKey": "API Key",
+      "apiKey": "Tên API key",
       "combo": "Combo",
       "tokens": "Tokens",
       "compressed": "nén",
       "tps": "TPS",
       "duration": "Duration",
-      "time": "Time"
+      "time": "Ngày giờ"
     },
     "loadingLogs": "Loading logs...",
     "noLogs": "No logs yet. Make some API calls to see them here.",

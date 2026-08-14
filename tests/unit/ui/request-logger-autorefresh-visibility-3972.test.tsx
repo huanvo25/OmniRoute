@@ -23,7 +23,8 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("next-intl", () => ({
-  useTranslations: () => (key: string) => key,
+  useLocale: () => "en-GB",
+  useTranslations: () => (key: string) => (key === "noApiKey" ? "Anonymous / no API key" : key),
 }));
 
 vi.mock("next/navigation", () => ({
@@ -115,6 +116,75 @@ afterEach(async () => {
 });
 
 describe("RequestLoggerV2 detail modal lifecycle", () => {
+  it("shows the full timestamp and identifies the API key used by each completed request", async () => {
+    setVisibility("visible");
+    localStorage.setItem("loggerVisibleColumns", JSON.stringify({ apiKey: false }));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.startsWith("/api/usage/call-logs")) {
+          return Response.json([
+            {
+              id: "named-key",
+              status: 200,
+              method: "POST",
+              path: "/v1/responses",
+              model: "codex/gpt-5.6-sol",
+              provider: "codex",
+              timestamp: "2026-08-14T17:52:29.000Z",
+              duration: 42,
+              tokens: { in: 1, out: 2 },
+              apiKeyName: "Codex production",
+              apiKeyId: "key-hidden-by-name",
+            },
+            {
+              id: "id-only-key",
+              status: 200,
+              method: "POST",
+              path: "/v1/responses",
+              model: "codex/gpt-5.6-sol",
+              provider: "codex",
+              timestamp: "2026-08-14T17:52:29.000Z",
+              duration: 42,
+              tokens: { in: 1, out: 2 },
+              apiKeyId: "key-id-only",
+            },
+            {
+              id: "anonymous-key",
+              status: 200,
+              method: "POST",
+              path: "/v1/responses",
+              model: "codex/gpt-5.6-sol",
+              provider: "codex",
+              timestamp: "2026-08-14T17:52:29.000Z",
+              duration: 42,
+              tokens: { in: 1, out: 2 },
+            },
+          ]);
+        }
+        if (url.startsWith("/api/provider-nodes")) return Response.json({ nodes: [] });
+        if (url.startsWith("/api/logs/detail")) return Response.json({ enabled: false });
+        return Response.json({});
+      })
+    );
+
+    await act(async () => {
+      root.render(<RequestLoggerV2 />);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    const text = container.textContent || "";
+    expect(text).toContain("columns.apiKey");
+    expect(text).toContain("Codex production");
+    expect(text).toContain("key-id-only");
+    expect(text).toContain("Anonymous / no API key");
+    expect(text).toMatch(/2026/);
+    expect(text).toMatch(/\d{2}:\d{2}:\d{2}/);
+  });
+
   it("does not reopen a manually closed detail modal when a stale detail fetch resolves", async () => {
     setVisibility("visible");
     const detail = deferredResponse();
