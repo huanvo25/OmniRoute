@@ -920,6 +920,7 @@ interface UploadedReferenceImage {
   fileId: string;
   mimeType: string;
   sizeBytes: number;
+  sha256: string;
   width?: number;
   height?: number;
 }
@@ -1087,6 +1088,7 @@ async function uploadReferenceImages(
       fileId,
       mimeType: image.mimeType,
       sizeBytes: image.bytes.length,
+      sha256: createHash("sha256").update(image.bytes).digest("hex"),
       ...imageDimensions(image.bytes, image.mimeType),
     });
   }
@@ -2082,15 +2084,29 @@ function buildStreamingResponse(
             uploadedReferencePointers
           );
 
+          // Resolve immediate pointers before deciding whether async polling
+          // is necessary. ChatGPT can echo a reference through a different
+          // file ID, which only the byte-level SHA check in the resolver can
+          // identify. A rejected echo must not short-circuit the wait for the
+          // actual generated image.
+          const stopImmediateResolveHeartbeat = startHeartbeat();
+          let urls: string[] = [];
+          try {
+            urls = await resolveImagePointers(
+              imagePointers,
+              conversationId,
+              resolver,
+              log,
+              parentCandidateMessageId
+            );
+          } finally {
+            stopImmediateResolveHeartbeat();
+          }
+
           // Async image_gen ends the SSE with a "Processing image..."
           // placeholder; poll the conversation endpoint in the background for
-          // the final pointer (only when in-stream pointers are empty).
-          if (
-            imageGenAsync &&
-            conversationId &&
-            (!imagePointers || imagePointers.length === 0) &&
-            pollAsyncImage
-          ) {
+          // the final pointer when no acceptable immediate image was found.
+          if (imageGenAsync && conversationId && urls.length === 0 && pollAsyncImage) {
             // Tell the user something is happening — long polls otherwise
             // look like a hang on the client side. The "..." plus a typing
             // cue renders nicely in Open WebUI.
@@ -2117,6 +2133,13 @@ function buildStreamingResponse(
             try {
               const polled = await pollAsyncImage(conversationId);
               imagePointers = excludeUploadedReferencePointers(polled, uploadedReferencePointers);
+              urls = await resolveImagePointers(
+                imagePointers,
+                conversationId,
+                resolver,
+                log,
+                parentCandidateMessageId
+              );
             } catch (err) {
               log?.warn?.(
                 "CGPT-WEB",
@@ -2128,21 +2151,8 @@ function buildStreamingResponse(
           }
 
           // Resolve and append any image markdown after the text deltas finish
-          // streaming. Downloading and caching the image bytes can take 1-3
-          // seconds for big images, so keep the heartbeat running here too.
-          const stopHb2 = startHeartbeat();
-          let urls: string[] = [];
-          try {
-            urls = await resolveImagePointers(
-              imagePointers,
-              conversationId,
-              resolver,
-              log,
-              parentCandidateMessageId
-            );
-          } finally {
-            stopHb2();
-          }
+          // streaming. The resolver has already materialized and SHA-checked
+          // either the immediate pointers or the asynchronously polled ones.
           // Bail out cleanly if the client disconnected during the wait —
           // any further enqueue throws "Invalid state: Controller is
           // already closed". Better to no-op than to surface that as a
@@ -2318,18 +2328,28 @@ async function buildNonStreamingResponse(
   fullAnswer = cleanChatGptText(fullAnswer, answerMetadata);
 
   imagePointers = excludeUploadedReferencePointers(imagePointers, uploadedReferencePointers);
+  let urls = await resolveImagePointers(
+    imagePointers,
+    conversationId,
+    resolver,
+    log,
+    parentCandidateMessageId
+  );
 
   // Async image gen: SSE ended with "Processing image..." — poll for the
-  // final pointer the same way the streaming path does.
-  if (
-    imageGenAsync &&
-    conversationId &&
-    (!imagePointers || imagePointers.length === 0) &&
-    pollAsyncImage
-  ) {
+  // final pointer when the immediate result was absent or was an echoed
+  // reference image rejected by the resolver's SHA check.
+  if (imageGenAsync && conversationId && urls.length === 0 && pollAsyncImage) {
     try {
       const polled = await pollAsyncImage(conversationId);
       imagePointers = excludeUploadedReferencePointers(polled, uploadedReferencePointers);
+      urls = await resolveImagePointers(
+        imagePointers,
+        conversationId,
+        resolver,
+        log,
+        parentCandidateMessageId
+      );
     } catch (err) {
       log?.warn?.(
         "CGPT-WEB",
@@ -2338,13 +2358,6 @@ async function buildNonStreamingResponse(
     }
   }
 
-  const urls = await resolveImagePointers(
-    imagePointers,
-    conversationId,
-    resolver,
-    log,
-    parentCandidateMessageId
-  );
   // The image genuinely exists upstream but no pointer resolved to a URL
   // (unknown asset scheme, download 403/expired, oversize). Flag it so the
   // image-generation handler can report an accurate "generated but not
@@ -2515,6 +2528,10 @@ interface ResolverContext {
    * came in on (localhost, Tailscale, cloudflared tunnel, etc.).
    */
   publicBaseUrl: string;
+  /** SHA-256 hashes of uploaded reference-image bytes for this request.
+   * ChatGPT may echo an input through a new file ID, so pointer comparison
+   * alone cannot distinguish that alias from a generated image. */
+  uploadedReferenceShas: ReadonlySet<string>;
 }
 
 async function fetchDownloadUrl(endpoint: string, ctx: ResolverContext): Promise<string | null> {
@@ -2646,6 +2663,14 @@ async function imageUrlToCachedImageUrl(
         `Image too large to cache (${bytes.length} bytes > ${IMAGE_DOWNLOAD_MAX_BYTES}); skipping`
       );
     }
+    return null;
+  }
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  if (ctx.uploadedReferenceShas.has(sha256)) {
+    ctx.log?.warn?.(
+      "CGPT-WEB",
+      "Rejected image result because its bytes match an uploaded reference image"
+    );
     return null;
   }
   // Cache the image and return a stable HTTP URL pointing at our own
@@ -2879,6 +2904,8 @@ async function waitForImageViaWebSocket(
 // during chatgpt.com queue-deep windows ("Lots of people are creating
 // images right now") without code changes.
 const DEFAULT_ASYNC_IMAGE_TIMEOUT_MS = 180_000;
+let asyncImagePollOverrideForTesting:
+  ((conversationId: string) => Promise<ImagePointerRef[]>) | null = null;
 
 function configuredAsyncImageTimeoutMs(): number {
   const raw = Number(process.env.OMNIROUTE_CGPT_WEB_IMAGE_TIMEOUT_MS);
@@ -3377,13 +3404,16 @@ export class ChatGptWebExecutor extends BaseExecutor {
       signal,
       log,
       publicBaseUrl: derivePublicBaseUrl(clientHeaders, log),
+      uploadedReferenceShas: new Set(uploadedReferenceImages.map((image) => image.sha256)),
     };
     const imageResolver = makeImageResolver(resolverCtx);
     const uploadedReferencePointers = new Set(
       uploadedReferenceImages.map((image) => `file-service://${image.fileId}`)
     );
     const pollAsyncImage = (conversationId: string) =>
-      pollForAsyncImage(conversationId, resolverCtx);
+      asyncImagePollOverrideForTesting
+        ? asyncImagePollOverrideForTesting(conversationId)
+        : pollForAsyncImage(conversationId, resolverCtx);
     const resumeFinalAnswer = (conversationId: string, resumeToken: string) =>
       resumeChatGptHandoff({
         conversationId,
@@ -3477,6 +3507,13 @@ export function __resetChatGptWebCachesForTesting(): void {
   deviceIdCache.clear();
   __resetChatGptImageCacheForTesting();
   dplCache = null;
+  asyncImagePollOverrideForTesting = null;
 }
 
 export const __derivePublicBaseUrlForTesting = derivePublicBaseUrl;
+
+export function __setAsyncImagePollOverrideForTesting(
+  override: ((conversationId: string) => Promise<ImagePointerRef[]>) | null
+): void {
+  asyncImagePollOverrideForTesting = override;
+}
