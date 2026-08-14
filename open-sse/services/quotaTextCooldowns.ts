@@ -38,6 +38,13 @@ export function isSubscriptionQuotaText(lower: string): boolean {
   );
 }
 
+export function isChatGptImageQuotaText(lower: string): boolean {
+  return (
+    lower.includes("plus plan limit for image generation") ||
+    lower.includes("plus plan limit for image generations")
+  );
+}
+
 const SUBSCRIPTION_QUOTA_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour
 
 /**
@@ -65,6 +72,21 @@ export function buildSubscriptionQuotaFallback(
     cooldownMs: hintMs ?? SUBSCRIPTION_QUOTA_COOLDOWN_MS,
     reason: RateLimitReason.QUOTA_EXHAUSTED,
     usedUpstreamRetryHint: Boolean(hintMs),
+    quotaResetHintMs: bodyHint ?? undefined,
+  };
+}
+
+export function buildChatGptImageQuotaFallback(
+  errorStr: string,
+  parseRetryFromErrorText: (text: string) => number | null
+): QuotaTextFallback | null {
+  if (!isChatGptImageQuotaText(errorStr.toLowerCase())) return null;
+  const bodyHint = parseRetryFromErrorText(errorStr);
+  return {
+    shouldFallback: true,
+    cooldownMs: bodyHint ?? SUBSCRIPTION_QUOTA_COOLDOWN_MS,
+    reason: RateLimitReason.QUOTA_EXHAUSTED,
+    usedUpstreamRetryHint: Boolean(bodyHint),
     quotaResetHintMs: bodyHint ?? undefined,
   };
 }
