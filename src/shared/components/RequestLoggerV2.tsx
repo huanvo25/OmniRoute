@@ -10,7 +10,7 @@ import {
   useImperativeHandle,
 } from "react";
 import { useRouter } from "next/navigation";
-import { useTranslations } from "next-intl";
+import { useLocale, useTranslations } from "next-intl";
 import Card from "./Card";
 import RequestLoggerDetail from "./RequestLoggerDetail";
 import { copyToClipboard } from "@/shared/utils/clipboard";
@@ -20,11 +20,10 @@ import {
   getProtocolColor,
 } from "@/shared/constants/colors";
 import {
-  formatTime,
+  formatApiKeyLabel,
   formatDuration,
   maskAccount,
   stableAccountSuffix,
-  formatApiKeyLabel,
 } from "@/shared/utils/formatting";
 import { getProviderDisplayLabel } from "@/shared/utils/providerDisplayLabel";
 import useEmailPrivacyStore from "@/store/emailPrivacyStore";
@@ -86,6 +85,24 @@ function getCacheSourceMeta(cacheSource: unknown) {
   };
 }
 
+function formatLogTimestamp(timestamp: string | null | undefined, locale: string): string {
+  if (!timestamp) return "—";
+
+  try {
+    return new Intl.DateTimeFormat(locale, {
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    }).format(new Date(timestamp));
+  } catch {
+    return "—";
+  }
+}
+
 export interface RequestLoggerV2Handle {
   openDetail: (logEntry: any) => void;
   getSortedLogs: () => any[];
@@ -95,6 +112,7 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
   (props, ref) => {
     const { initialSelectedId } = props as any;
     const t = useTranslations("requestLogger");
+    const locale = useLocale();
     const { emailsVisible } = useEmailPrivacyStore();
 
     // Get translated status filters
@@ -193,7 +211,7 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
       if (globalThis.window === undefined) return defaultVisible;
       try {
         const saved = localStorage.getItem("loggerVisibleColumns");
-        return saved ? { ...defaultVisible, ...JSON.parse(saved) } : defaultVisible;
+        return saved ? { ...defaultVisible, ...JSON.parse(saved), apiKey: true } : defaultVisible;
       } catch {
         return defaultVisible;
       }
@@ -1261,6 +1279,7 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
                     const cacheSourceMeta = getCacheSourceMeta(log.cacheSource);
                     const isSemanticCache = cacheSourceMeta?.key === "semantic";
                     const accountLabel = maskAccount(log.account, emailsVisible);
+                    const apiKeyLabel = log.apiKeyName || log.apiKeyId || t("noApiKey");
 
                     return (
                       <tr
@@ -1477,12 +1496,12 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
                         {visibleColumns.apiKey && (
                           <td
                             className="px-3 py-2 text-text-muted truncate max-w-[140px]"
-                            title={log.apiKeyName || log.apiKeyId || t("noApiKey")}
+                            title={apiKeyLabel}
                           >
                             {isActive ? (
                               <span className="text-text-muted text-[10px]">—</span>
                             ) : (
-                              formatApiKeyLabel(log.apiKeyName, log.apiKeyId)
+                              apiKeyLabel
                             )}
                           </td>
                         )}
@@ -1559,8 +1578,11 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
                           </td>
                         )}
                         {visibleColumns.time && (
-                          <td className="px-3 py-2 text-right text-text-muted">
-                            {formatTime(log.timestamp)}
+                          <td
+                            className="px-3 py-2 text-right text-text-muted whitespace-nowrap tabular-nums"
+                            title={log.timestamp || undefined}
+                          >
+                            {formatLogTimestamp(log.timestamp, locale)}
                           </td>
                         )}
                       </tr>

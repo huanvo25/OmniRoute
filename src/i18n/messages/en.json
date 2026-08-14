@@ -8266,7 +8266,7 @@
     "upstream": "Upstream",
     "semanticCacheHit": "Semantic cache hit (served by OmniRoute)",
     "upstreamResponse": "Upstream provider response",
-    "noApiKey": "No API key",
+    "noApiKey": "Anonymous / no API key",
     "requestedRoutedTitle": "Requested {requested}, routed as {routed}",
     "statusFilters": {
       "all": "All",
@@ -8282,13 +8282,13 @@
       "provider": "Provider",
       "protocol": "Request Protocol",
       "account": "Account",
-      "apiKey": "API Key",
+      "apiKey": "API Key Name",
       "combo": "Combo",
       "tokens": "Tokens",
       "compressed": "Compression",
       "tps": "TPS",
       "duration": "Duration",
-      "time": "Time"
+      "time": "Date & Time"
     },
     "loadingLogs": "Loading logs...",
     "noLogs": "No logs yet. Make some API calls to see them here.",
