@@ -1860,6 +1860,17 @@ async function resolveImagePointers(
   return urls;
 }
 
+function excludeUploadedReferencePointers(
+  pointers: ImagePointerRef[] | undefined,
+  uploadedReferencePointers: ReadonlySet<string>
+): ImagePointerRef[] | undefined {
+  if (!pointers || pointers.length === 0 || uploadedReferencePointers.size === 0) {
+    return pointers;
+  }
+  const generatedPointers = pointers.filter((ref) => !uploadedReferencePointers.has(ref.pointer));
+  return generatedPointers.length > 0 ? generatedPointers : undefined;
+}
+
 function buildStreamingResponse(
   eventStream: ReadableStream<Uint8Array>,
   model: string,
@@ -1877,6 +1888,7 @@ function buildStreamingResponse(
     ((conversationId: string, resumeToken: string) => Promise<FinalAssistantAnswer | null>) | null,
   // Legacy fallback for handoffs that omit the conduit token.
   pollFinalAnswer: ((conversationId: string) => Promise<FinalAssistantAnswer | null>) | null,
+  uploadedReferencePointers: ReadonlySet<string>,
   log: { warn?: (tag: string, msg: string) => void } | null,
   signal?: AbortSignal | null
 ): ReadableStream<Uint8Array> {
@@ -2060,6 +2072,16 @@ function buildStreamingResponse(
             appendFinalAnswer(polledFinalAnswer.text, polledFinalAnswer.metadata);
           }
 
+          // ChatGPT may echo an uploaded reference as an assistant-side image
+          // pointer before the async image_gen result lands. That pointer is
+          // the input file, not the generated output. If it is left in the
+          // result set, the OpenAI-compatible image endpoint returns Hình 1
+          // or Hình 2 byte-for-byte and skips the WebSocket wait entirely.
+          imagePointers = excludeUploadedReferencePointers(
+            imagePointers,
+            uploadedReferencePointers
+          );
+
           // Async image_gen ends the SSE with a "Processing image..."
           // placeholder; poll the conversation endpoint in the background for
           // the final pointer (only when in-stream pointers are empty).
@@ -2094,7 +2116,7 @@ function buildStreamingResponse(
             const stopHb = startHeartbeat();
             try {
               const polled = await pollAsyncImage(conversationId);
-              if (polled.length > 0) imagePointers = polled;
+              imagePointers = excludeUploadedReferencePointers(polled, uploadedReferencePointers);
             } catch (err) {
               log?.warn?.(
                 "CGPT-WEB",
@@ -2227,6 +2249,7 @@ async function buildNonStreamingResponse(
   resumeFinalAnswer:
     ((conversationId: string, resumeToken: string) => Promise<FinalAssistantAnswer | null>) | null,
   pollFinalAnswer: ((conversationId: string) => Promise<FinalAssistantAnswer | null>) | null,
+  uploadedReferencePointers: ReadonlySet<string>,
   log: { warn?: (tag: string, msg: string) => void } | null,
   signal?: AbortSignal | null
 ): Promise<Response> {
@@ -2294,6 +2317,8 @@ async function buildNonStreamingResponse(
 
   fullAnswer = cleanChatGptText(fullAnswer, answerMetadata);
 
+  imagePointers = excludeUploadedReferencePointers(imagePointers, uploadedReferencePointers);
+
   // Async image gen: SSE ended with "Processing image..." — poll for the
   // final pointer the same way the streaming path does.
   if (
@@ -2304,7 +2329,7 @@ async function buildNonStreamingResponse(
   ) {
     try {
       const polled = await pollAsyncImage(conversationId);
-      if (polled.length > 0) imagePointers = polled;
+      imagePointers = excludeUploadedReferencePointers(polled, uploadedReferencePointers);
     } catch (err) {
       log?.warn?.(
         "CGPT-WEB",
@@ -3354,6 +3379,9 @@ export class ChatGptWebExecutor extends BaseExecutor {
       publicBaseUrl: derivePublicBaseUrl(clientHeaders, log),
     };
     const imageResolver = makeImageResolver(resolverCtx);
+    const uploadedReferencePointers = new Set(
+      uploadedReferenceImages.map((image) => `file-service://${image.fileId}`)
+    );
     const pollAsyncImage = (conversationId: string) =>
       pollForAsyncImage(conversationId, resolverCtx);
     const resumeFinalAnswer = (conversationId: string, resumeToken: string) =>
@@ -3384,6 +3412,7 @@ export class ChatGptWebExecutor extends BaseExecutor {
         pollAsyncImage,
         resumeFinalAnswer,
         pollFinalAnswer,
+        uploadedReferencePointers,
         log,
         signal
       );
@@ -3406,6 +3435,7 @@ export class ChatGptWebExecutor extends BaseExecutor {
         pollAsyncImage,
         resumeFinalAnswer,
         pollFinalAnswer,
+        uploadedReferencePointers,
         log,
         signal
       );

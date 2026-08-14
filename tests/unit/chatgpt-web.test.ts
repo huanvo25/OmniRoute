@@ -3242,6 +3242,87 @@ test("Reference images are uploaded and forwarded as ChatGPT multimodal attachme
   }
 });
 
+test("Reference-image echoes are excluded from generated image results", async () => {
+  reset();
+  const downloadedFileIds: string[] = [];
+  const events = [
+    {
+      type: "server_ste_metadata",
+      metadata: { turn_use_case: "image gen" },
+    },
+    {
+      conversation_id: "conv-img-reference-echo",
+      message: {
+        id: "msg-reference-echo",
+        author: { role: "assistant" },
+        content: {
+          content_type: "multimodal_text",
+          parts: [
+            {
+              content_type: "image_asset_pointer",
+              asset_pointer: "file-service://file-reference-1",
+            },
+            {
+              content_type: "image_asset_pointer",
+              asset_pointer: "file-service://file-generated-1",
+            },
+          ],
+        },
+        status: "finished_successfully",
+      },
+    },
+  ];
+  const m = installMockFetch({
+    conv: { status: 200, events },
+    onFileDownload: (_opts, fileId) => downloadedFileIds.push(fileId),
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(null, { status: 200 });
+  const png = Buffer.from([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03,
+  ]);
+
+  try {
+    const executor = new ChatGptWebExecutor();
+    const result = await executor.execute({
+      model: "gpt-5.3-instant",
+      body: {
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "Create a new image from this reference" },
+              {
+                type: "image_url",
+                image_url: { url: `data:image/png;base64,${png.toString("base64")}` },
+              },
+            ],
+          },
+        ],
+      },
+      stream: false,
+      credentials: { apiKey: "test" },
+      signal: AbortSignal.timeout(10_000),
+      log: null,
+    });
+    assert.equal(result.response.status, 200);
+    const json = await result.response.json();
+    assert.match(
+      json.choices[0].message.content,
+      /!\[image\]\([^)]*\/v1\/chatgpt-web\/image\/[a-f0-9]+\)/
+    );
+    assert.deepEqual(
+      downloadedFileIds,
+      ["file-generated-1"],
+      "the uploaded reference must never be returned as the generated Final"
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    m.restore();
+  }
+});
+
 test("Image cache: deleting an entry decrements the byte counter", async () => {
   // Regression guard: an earlier draft tracked entry count but not bytes,
   // and TTL eviction removed the entry without crediting back its size —
