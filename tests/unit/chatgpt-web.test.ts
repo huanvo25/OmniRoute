@@ -193,6 +193,30 @@ function installMockFetch({
       };
     }
 
+    // Reference-image upload registration/finalization. The signed upload
+    // headers mirror the production response so tests cover their forwarding.
+    if (u === "https://chatgpt.com/backend-api/files" && (opts.method || "GET") === "POST") {
+      return {
+        status: 200,
+        headers: makeHeaders({ "Content-Type": "application/json" }),
+        text: JSON.stringify({
+          file_id: "file-reference-1",
+          upload_url: "https://uploads.example.test/reference-1",
+          upload_headers: { "x-ms-blob-type": "BlockBlob" },
+        }),
+        body: null,
+      };
+    }
+
+    if (/\/backend-api\/files\/[^/]+\/uploaded$/.test(u)) {
+      return {
+        status: 200,
+        headers: makeHeaders({ "Content-Type": "application/json" }),
+        text: "{}",
+        body: null,
+      };
+    }
+
     // /backend-api/conversation/<conv_id>/attachment/<file_id>/download
     // Must match BEFORE the conversation-endpoint regex below since the
     // conv-prefix regex is broad.
@@ -2869,6 +2893,174 @@ test("Image gen handler: n>4 is rejected before any upstream call", async () => 
     assert.equal(m.calls.session, 0, "no session exchange was attempted");
     assert.equal(m.calls.conv, 0, "no conversation request was attempted");
   } finally {
+    m.restore();
+  }
+});
+
+test("Reference images are uploaded and forwarded as ChatGPT multimodal attachments", async () => {
+  reset();
+  const m = installMockFetch();
+  const originalFetch = globalThis.fetch;
+  const uploads: Array<{ url: string; method: string; contentType: string | null; bytes: number }> =
+    [];
+  globalThis.fetch = async (url, options = {}) => {
+    uploads.push({
+      url: String(url),
+      method: String(options.method || "GET"),
+      contentType: new Headers(options.headers).get("content-type"),
+      bytes: Buffer.isBuffer(options.body) ? options.body.length : 0,
+    });
+    return new Response(null, { status: 200 });
+  };
+
+  // PNG signature + IHDR whose dimensions are 2×3.
+  const png = Buffer.from([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03,
+  ]);
+
+  try {
+    const executor = new ChatGptWebExecutor();
+    const result = await executor.execute({
+      model: "gpt-5.3-instant",
+      body: {
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "Create an image using this reference" },
+              {
+                type: "image_url",
+                image_url: { url: `data:image/png;base64,${png.toString("base64")}` },
+              },
+            ],
+          },
+        ],
+      },
+      stream: false,
+      credentials: { apiKey: "test" },
+      signal: AbortSignal.timeout(10_000),
+      log: null,
+    });
+    assert.equal(result.response.status, 200);
+    assert.deepEqual(uploads, [
+      {
+        url: "https://uploads.example.test/reference-1",
+        method: "PUT",
+        contentType: "image/png",
+        bytes: png.length,
+      },
+    ]);
+
+    const fileRegistration = JSON.parse(
+      m.calls.bodies[m.calls.urls.indexOf("https://chatgpt.com/backend-api/files")] || "{}"
+    );
+    assert.deepEqual(fileRegistration, {
+      file_name: "reference-1.png",
+      file_size: png.length,
+      mime_type: "image/png",
+      use_case: "multimodal",
+    });
+    assert.ok(
+      m.calls.urls.includes("https://chatgpt.com/backend-api/files/file-reference-1/uploaded"),
+      "upload was finalized before the conversation request"
+    );
+    const conversationIndex = m.calls.urls.findIndex((url) =>
+      url.endsWith("/backend-api/f/conversation")
+    );
+    const conversation = JSON.parse(m.calls.bodies[conversationIndex] || "{}");
+    const userMessage = conversation.messages[conversation.messages.length - 1];
+    assert.equal(userMessage.content.content_type, "multimodal_text");
+    assert.deepEqual(userMessage.content.parts[1], {
+      content_type: "image_asset_pointer",
+      asset_pointer: "file-service://file-reference-1",
+      size_bytes: png.length,
+      width: 2,
+      height: 3,
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+    m.restore();
+  }
+});
+
+test("Reference-image echoes are excluded from generated image results", async () => {
+  reset();
+  const downloadedFileIds: string[] = [];
+  const events = [
+    {
+      type: "server_ste_metadata",
+      metadata: { turn_use_case: "image gen" },
+    },
+    {
+      conversation_id: "conv-img-reference-echo",
+      message: {
+        id: "msg-reference-echo",
+        author: { role: "assistant" },
+        content: {
+          content_type: "multimodal_text",
+          parts: [
+            {
+              content_type: "image_asset_pointer",
+              asset_pointer: "file-service://file-reference-1",
+            },
+            {
+              content_type: "image_asset_pointer",
+              asset_pointer: "file-service://file-generated-1",
+            },
+          ],
+        },
+        status: "finished_successfully",
+      },
+    },
+  ];
+  const m = installMockFetch({
+    conv: { status: 200, events },
+    onFileDownload: (_opts, fileId) => downloadedFileIds.push(fileId),
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(null, { status: 200 });
+  const png = Buffer.from([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03,
+  ]);
+
+  try {
+    const executor = new ChatGptWebExecutor();
+    const result = await executor.execute({
+      model: "gpt-5.3-instant",
+      body: {
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "Create a new image from this reference" },
+              {
+                type: "image_url",
+                image_url: { url: `data:image/png;base64,${png.toString("base64")}` },
+              },
+            ],
+          },
+        ],
+      },
+      stream: false,
+      credentials: { apiKey: "test" },
+      signal: AbortSignal.timeout(10_000),
+      log: null,
+    });
+    assert.equal(result.response.status, 200);
+    const json = await result.response.json();
+    assert.match(
+      json.choices[0].message.content,
+      /!\[image\]\([^)]*\/v1\/chatgpt-web\/image\/[a-f0-9]+\)/
+    );
+    assert.deepEqual(
+      downloadedFileIds,
+      ["file-generated-1"],
+      "the uploaded reference must never be returned as the generated Final"
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
     m.restore();
   }
 });
