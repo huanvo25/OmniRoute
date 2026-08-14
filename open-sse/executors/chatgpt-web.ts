@@ -1035,7 +1035,11 @@ async function uploadReferenceImages(
       throw new ReferenceImageUploadError("ChatGPT Web could not prepare a reference image upload");
     }
 
-    let registrationBody: { file_id?: unknown; upload_url?: unknown };
+    let registrationBody: {
+      file_id?: unknown;
+      upload_url?: unknown;
+      upload_headers?: unknown;
+    };
     try {
       registrationBody = JSON.parse(registration.text || "{}");
     } catch {
@@ -1052,11 +1056,36 @@ async function uploadReferenceImages(
       );
     }
 
+    // Preserve any signed headers returned with the upload URL. Depending on
+    // ChatGPT's current storage backend, omitting these values can invalidate
+    // the otherwise valid pre-signed request.
+    const uploadHeaders = new Headers();
+    if (registrationBody.upload_headers && typeof registrationBody.upload_headers === "object") {
+      for (const [key, value] of Object.entries(registrationBody.upload_headers)) {
+        if (typeof value === "string") uploadHeaders.set(key, value);
+      }
+    }
+    if (!uploadHeaders.has("content-type")) {
+      uploadHeaders.set("content-type", image.mimeType);
+    }
+    // ChatGPT currently uses Azure Blob Storage for this upload path. Put Blob
+    // requires BlockBlob metadata; keep registration-provided values authoritative
+    // and fill only fields that ChatGPT omitted.
+    if (!uploadHeaders.has("x-ms-blob-type")) {
+      uploadHeaders.set("x-ms-blob-type", "BlockBlob");
+    }
+    if (!uploadHeaders.has("x-ms-version")) {
+      uploadHeaders.set("x-ms-version", "2020-04-08");
+    }
+    if (!uploadHeaders.has("content-length")) {
+      uploadHeaders.set("content-length", String(image.bytes.length));
+    }
+
     let putResponse: Response;
     try {
       putResponse = await fetch(uploadUrl, {
         method: "PUT",
-        headers: { "Content-Type": image.mimeType },
+        headers: uploadHeaders,
         body: image.bytes,
         signal: signal ?? undefined,
       });
@@ -1064,7 +1093,27 @@ async function uploadReferenceImages(
       throw new ReferenceImageUploadError("ChatGPT Web could not upload a reference image");
     }
     if (!putResponse.ok) {
-      throw new ReferenceImageUploadError("ChatGPT Web rejected a reference image upload");
+      const responseText = await putResponse.text().catch(() => "");
+      const xmlCode = /<Code>([A-Za-z0-9_.-]{1,80})<\/Code>/i.exec(responseText)?.[1];
+      let jsonCode: string | null = null;
+      try {
+        const parsed = JSON.parse(responseText || "{}") as {
+          code?: unknown;
+          error?: { code?: unknown };
+        };
+        const candidate = parsed.error?.code ?? parsed.code;
+        if (typeof candidate === "string" && /^[A-Za-z0-9_.-]{1,80}$/.test(candidate)) {
+          jsonCode = candidate;
+        }
+      } catch {
+        // Non-JSON storage errors are commonly XML; xmlCode above remains enough.
+      }
+      const upstreamCode = xmlCode ?? jsonCode;
+      throw new ReferenceImageUploadError(
+        `ChatGPT Web rejected a reference image upload (HTTP ${putResponse.status}${
+          upstreamCode ? `, ${upstreamCode}` : ""
+        })`
+      );
     }
 
     const confirmation = await tlsFetchChatGpt(
