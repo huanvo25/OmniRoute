@@ -38,7 +38,9 @@ import { isRpdExhausted, isRpmExhausted } from "./geminiRateLimitTracker.ts";
 import { setConnectionRateLimitUntil } from "@/lib/db/providers";
 import { parseRetryHintFromJsonBody } from "./retryAfterJson.ts";
 import {
+  buildChatGptImageQuotaFallback,
   isSubscriptionQuotaText,
+  isChatGptImageQuotaText,
   buildSubscriptionQuotaFallback,
   buildWeeklyQuotaFallback,
 } from "./quotaTextCooldowns.ts";
@@ -1077,6 +1079,20 @@ export function parseRetryFromErrorText(errorText: unknown): number | null {
     return computeDurationMs(resetsInMatch);
   }
 
+  const naturalResetsInMatch =
+    /resets? in\s+(?:(\d+)\s*hours?)?(?:\s*(?:and\s*)?(\d+)\s*minutes?)?(?:\s*(?:and\s*)?(\d+)\s*seconds?)?/i.exec(
+      msg
+    );
+  if (naturalResetsInMatch?.[1] || naturalResetsInMatch?.[2] || naturalResetsInMatch?.[3]) {
+    const hours = Number.parseInt(naturalResetsInMatch[1] || "0", 10);
+    const minutes = Number.parseInt(naturalResetsInMatch[2] || "0", 10);
+    const seconds = Number.parseInt(naturalResetsInMatch[3] || "0", 10);
+    return Math.min(
+      hours * 60 * 60 * 1000 + minutes * 60 * 1000 + seconds * 1000,
+      MAX_PROVIDER_COOLDOWN_MS
+    );
+  }
+
   return parseDayGranularityResetMs(msg, MAX_PROVIDER_COOLDOWN_MS);
 }
 
@@ -1112,6 +1128,7 @@ export function classifyErrorText(errorText: unknown): RateLimitReasonValue {
     lower.includes("hour quota") ||
     lower.includes("billing") ||
     looksLikeQuotaExhausted(lower) ||
+    isChatGptImageQuotaText(lower) ||
     // Issue #2321: Anthropic OAuth (Claude Code Pro/Team) 429 bodies surface
     // the subscription quota with phrases that contain neither "quota" nor
     // "billing". Without these patterns the error was classified as a
@@ -1452,6 +1469,11 @@ export function checkFallbackError(
       );
       if (subResult) return subResult;
     }
+    const chatGptImageQuotaResult = buildChatGptImageQuotaFallback(
+      errorStr,
+      parseRetryFromErrorText
+    );
+    if (chatGptImageQuotaResult) return chatGptImageQuotaResult;
     const weeklyResult = buildWeeklyQuotaFallback(errorStr);
     if (weeklyResult) return weeklyResult;
 

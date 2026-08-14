@@ -14,6 +14,7 @@ const MAX_REFERENCE_IMAGES = 4;
 const MAX_REFERENCE_IMAGE_BYTES = 10 * 1024 * 1024;
 const MAX_REFERENCE_IMAGE_TOTAL_BYTES = 20 * 1024 * 1024;
 const IMAGE_DATA_URL_RE = /^data:(image\/(?:png|jpe?g|webp|gif));base64,([A-Za-z0-9+/]+={0,2})$/i;
+const CHATGPT_WEB_IMAGE_QUOTA_RE = /plus plan limit for image generations?\s+requests?/i;
 
 /**
  * Extract the OpenAI-compatible reference-image fields accepted by image
@@ -83,6 +84,10 @@ export function extractMarkdownImageUrls(text: string): string[] {
     if (match[1]) urls.push(match[1]);
   }
   return urls;
+}
+
+export function isChatGptWebImageQuotaMessage(text: string): boolean {
+  return CHATGPT_WEB_IMAGE_QUOTA_RE.test(text);
 }
 
 export function buildChatGptWebImagePrompt(body): string {
@@ -247,6 +252,16 @@ export async function handleChatGptWebImageGeneration({
 
     const urls = extractMarkdownImageUrls(content);
     if (urls.length === 0) {
+      if (isChatGptWebImageQuotaMessage(content)) {
+        return saveImageErrorResult({
+          provider,
+          model,
+          status: 429,
+          startTime,
+          error: content,
+          requestBody,
+        });
+      }
       // Distinguish "image was generated upstream but OmniRoute could not
       // retrieve it" (executor flagged the unresolved asset pointer) from
       // "no image was produced at all" — the former is our bug/limitation,

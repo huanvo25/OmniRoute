@@ -80,6 +80,23 @@ test("handler keeps the generic 502 when no image was generated at all", async (
   assert.match(res.error, /completed without returning image markdown/i);
 });
 
+test("handler maps the ChatGPT Plus image-generation limit to 429", async () => {
+  const quotaText =
+    "You've hit the Plus plan limit for image generations requests. " +
+    "You can create more images when the limit resets in 11 hours and 37 minutes.";
+  const res = await handleChatGptWebImageGeneration({
+    ...baseArgs,
+    executorFactory: () =>
+      fakeExecutor({
+        choices: [{ message: { role: "assistant", content: quotaText } }],
+      }),
+  });
+
+  assert.equal(res.success, false);
+  assert.equal(res.status, 429);
+  assert.match(res.error, /Plus plan limit for image generations/i);
+});
+
 test("handler returns success when the executor produced image markdown", async () => {
   const url = "/v1/chatgpt-web/image/abcdef0123456789";
   const res = await handleChatGptWebImageGeneration({

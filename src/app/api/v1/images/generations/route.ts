@@ -5,6 +5,7 @@ import {
   clearRecoveredProviderState,
   extractApiKey,
   isValidApiKey,
+  markAccountUnavailable,
 } from "@/sse/services/auth";
 import {
   parseImageModel,
@@ -26,6 +27,7 @@ import { attachOmniRouteMetaHeaders } from "@/domain/omnirouteResponseMeta";
 import { calculateModalCost } from "@/lib/usage/costCalculator";
 import { generateRequestId } from "@/shared/utils/requestId";
 import { getSpecialtyModelsResponse } from "@/app/api/v1/_shared/specialtyCatalog";
+import { runImageGenerationAccountLoop } from "@/lib/images/imageAccountFallback";
 
 export const dynamic = "force-dynamic";
 
@@ -168,73 +170,85 @@ async function postHandler(request, context) {
     );
   }
 
-  // Get credentials — skip for local providers (authType: "none")
+  const requiresCredentials =
+    (providerConfig && providerConfig.authType !== "none") || isCustomModel;
+  const executeWithCredentials = async (credentials) => {
+    let proxyInfo = null;
+    if (credentials?.connectionId) {
+      try {
+        proxyInfo = await resolveProxyForConnection(credentials.connectionId);
+      } catch {
+        log.debug("PROXY", `Failed to resolve proxy for image provider: ${provider}`);
+      }
+    }
+
+    const generateImage = () =>
+      handleImageGeneration({
+        body,
+        credentials,
+        log,
+        ...(isCustomModel && { resolvedProvider: provider }),
+        signal: request.signal,
+        clientHeaders: publicBaseUrlHeaders(request.headers),
+      });
+
+    return credentials?.connectionId
+      ? runWithProxyContext(proxyInfo?.proxy || null, generateImage).catch((err: any) => ({
+          success: false,
+          status: err.statusCode || 500,
+          error: err.message,
+        }))
+      : generateImage();
+  };
+
   let credentials = null;
-  if (providerConfig && providerConfig.authType !== "none") {
-    credentials = await getProviderCredentialsWithQuotaPreflight(provider);
-    if (!credentials) {
-      return errorResponse(
-        HTTP_STATUS.BAD_REQUEST,
-        `No credentials for image provider: ${provider}`
-      );
-    }
-    if (credentials.allRateLimited) {
-      return unavailableResponse(
-        HTTP_STATUS.RATE_LIMITED,
-        `[${provider}] All accounts rate limited`,
-        credentials.retryAfter,
-        credentials.retryAfterHuman
-      );
-    }
-  } else if (isCustomModel) {
-    credentials = await getProviderCredentialsWithQuotaPreflight(provider);
-    if (!credentials) {
-      return errorResponse(
-        HTTP_STATUS.BAD_REQUEST,
-        `No credentials for custom image provider: ${provider}`
-      );
-    }
-    if (credentials.allRateLimited) {
-      return unavailableResponse(
-        HTTP_STATUS.RATE_LIMITED,
-        `[${provider}] All accounts rate limited`,
-        credentials.retryAfter,
-        credentials.retryAfterHuman
-      );
-    }
-  }
-
-  // Resolve proxy for the connection if credentials exist (#1904)
-  let proxyInfo = null;
-  if (credentials?.connectionId) {
-    try {
-      proxyInfo = await resolveProxyForConnection(credentials.connectionId);
-    } catch {
-      log.debug("PROXY", `Failed to resolve proxy for image provider: ${provider}`);
-    }
-  }
-
-  const generateImage = () =>
-    handleImageGeneration({
-      body,
-      credentials,
-      log,
-      ...(isCustomModel && { resolvedProvider: provider }),
-      signal: request.signal,
-      clientHeaders: publicBaseUrlHeaders(request.headers),
+  let result;
+  if (!requiresCredentials) {
+    result = await executeWithCredentials(null);
+  } else {
+    const outcome = await runImageGenerationAccountLoop({
+      selectCredentials: (excludedConnectionIds) =>
+        getProviderCredentialsWithQuotaPreflight(provider, null, null, body.model, {
+          excludeConnectionIds: excludedConnectionIds,
+        }),
+      execute: executeWithCredentials,
+      shouldRotate: (failedResult, selectedCredentials) =>
+        providerConfig?.format === "chatgpt-web" &&
+        failedResult.status === HTTP_STATUS.RATE_LIMITED &&
+        Boolean(selectedCredentials?.connectionId),
+      markUnavailable: (selectedCredentials, failedResult) =>
+        markAccountUnavailable(
+          selectedCredentials.connectionId as string,
+          HTTP_STATUS.RATE_LIMITED,
+          typeof failedResult.error === "string"
+            ? failedResult.error
+            : JSON.stringify(failedResult.error),
+          provider,
+          body.model
+        ),
+      clearRecoveredState: clearRecoveredProviderState,
     });
 
-  // Execute with proxy context when available, direct otherwise (#1904)
-  const result = await (credentials?.connectionId
-    ? runWithProxyContext(proxyInfo?.proxy || null, generateImage).catch((err: any) => ({
-        success: false,
-        status: err.statusCode || 500,
-        error: err.message,
-      }))
-    : generateImage());
+    if (outcome.kind === "no_credentials") {
+      return errorResponse(
+        HTTP_STATUS.BAD_REQUEST,
+        `No credentials for ${isCustomModel ? "custom " : ""}image provider: ${provider}`
+      );
+    }
+    if (outcome.kind === "all_rate_limited") {
+      return unavailableResponse(
+        HTTP_STATUS.RATE_LIMITED,
+        `[${provider}] All accounts rate limited`,
+        outcome.credentials.retryAfter,
+        outcome.credentials.retryAfterHuman
+      );
+    }
+    credentials = outcome.credentials;
+    result = outcome.result;
+  }
 
   if (result.success) {
-    await clearRecoveredProviderState(credentials);
+    if (!requiresCredentials) await clearRecoveredProviderState(credentials);
     const n = Math.max(
       Number(body.n) || 1,
       (result as { data?: { data?: unknown[] } }).data?.data?.length || 0
