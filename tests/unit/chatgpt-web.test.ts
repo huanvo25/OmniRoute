@@ -219,6 +219,30 @@ function installMockFetch({
       };
     }
 
+    // Initial reference-image upload: ChatGPT creates a signed upload URL,
+    // receives the bytes there, then marks the file uploaded before the
+    // conversation carries its file-service attachment pointer.
+    if (u === "https://chatgpt.com/backend-api/files" && (opts.method || "GET") === "POST") {
+      return {
+        status: 200,
+        headers: makeHeaders({ "Content-Type": "application/json" }),
+        text: JSON.stringify({
+          file_id: "file-reference-1",
+          upload_url: "https://uploads.example.test/reference-1",
+        }),
+        body: null,
+      };
+    }
+
+    if (/\/backend-api\/files\/[^/]+\/uploaded$/.test(u)) {
+      return {
+        status: 200,
+        headers: makeHeaders({ "Content-Type": "application/json" }),
+        text: "{}",
+        body: null,
+      };
+    }
+
     // /backend-api/conversation/<conv_id>/attachment/<file_id>/download
     // Must match BEFORE the conversation-endpoint regex below since the
     // conv-prefix regex is broad.
@@ -2309,6 +2333,37 @@ test("Image gen: sediment:// pointer prefers /files/<id>/download over /attachme
   }
 });
 
+test("Image gen: sediment:// uses conversation attachment after transient file-service failures", async () => {
+  reset();
+  const m = installMockFetch({
+    conv: { status: 200, events: imageGenEvents({ pointer: "sediment://file-sed-retry" }) },
+    fileDownload: { status: 503, body: { error: "materialising" } },
+  });
+  try {
+    const executor = new ChatGptWebExecutor();
+    const result = await executor.execute({
+      model: "gpt-5.3-instant",
+      body: { messages: [{ role: "user", content: "make a kitten" }] },
+      stream: false,
+      credentials: { apiKey: "test" },
+      signal: AbortSignal.timeout(10_000),
+      log: null,
+    });
+    assert.equal(result.response.status, 200);
+    const json = await result.response.json();
+    assert.match(
+      json.choices[0].message.content,
+      /!\[image\]\([^)]*\/v1\/chatgpt-web\/image\/[a-f0-9]+\)/,
+      "conversation attachment recovered the already-created image"
+    );
+    assert.equal(m.calls.fileDownload, 3, "retried the retrieval-only file GET");
+    assert.equal(m.calls.attachmentDownload, 1, "then used the sediment attachment endpoint");
+    assert.equal(m.calls.conv, 1, "never started a second image generation turn");
+  } finally {
+    m.restore();
+  }
+});
+
 test("Image gen: failed download URL is dropped silently — no broken markdown", async () => {
   reset();
   // Both /files/<id>/download AND the /conversation/<cid>/attachment/<fid>/
@@ -2846,7 +2901,11 @@ test("Image gen: bytes-fetch failure drops markdown (no signed-URL fallback)", a
       "signed URL is never leaked to client"
     );
     assert.equal(m.calls.fileDownload, 1, "download URL was attempted");
-    assert.equal(m.calls.signedDownload, 1, "signed-bytes fetch was attempted and failed");
+    assert.equal(
+      m.calls.signedDownload,
+      3,
+      "signed-bytes fetch was retried without a new generation"
+    );
   } finally {
     m.restore();
   }
@@ -2918,7 +2977,7 @@ test("Image edit: file_0000XXXX (chatgpt-web edit result) falls back to /convers
       /!\[image\]\([^)]*\/v1\/chatgpt-web\/image\/[a-f0-9]+\)/,
       "image rendered via fallback"
     );
-    assert.equal(m.calls.fileDownload, 1, "tried /files/ first");
+    assert.equal(m.calls.fileDownload, 3, "retried /files/ before attachment fallback");
     assert.equal(
       m.calls.attachmentDownload,
       1,
@@ -3092,6 +3151,93 @@ test("Image gen handler: n>4 is rejected before any upstream call", async () => 
     assert.equal(m.calls.session, 0, "no session exchange was attempted");
     assert.equal(m.calls.conv, 0, "no conversation request was attempted");
   } finally {
+    m.restore();
+  }
+});
+
+test("Reference images are uploaded and forwarded as ChatGPT multimodal attachments", async () => {
+  reset();
+  const m = installMockFetch();
+  const originalFetch = globalThis.fetch;
+  const uploads: Array<{ url: string; method: string; contentType: string | null; bytes: number }> =
+    [];
+  globalThis.fetch = async (url, options = {}) => {
+    uploads.push({
+      url: String(url),
+      method: String(options.method || "GET"),
+      contentType: new Headers(options.headers).get("content-type"),
+      bytes: Buffer.isBuffer(options.body) ? options.body.length : 0,
+    });
+    return new Response(null, { status: 200 });
+  };
+
+  // PNG signature + IHDR whose dimensions are 2×3.
+  const png = Buffer.from([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03,
+  ]);
+
+  try {
+    const executor = new ChatGptWebExecutor();
+    const result = await executor.execute({
+      model: "gpt-5.3-instant",
+      body: {
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "Create an image using this reference" },
+              {
+                type: "image_url",
+                image_url: { url: `data:image/png;base64,${png.toString("base64")}` },
+              },
+            ],
+          },
+        ],
+      },
+      stream: false,
+      credentials: { apiKey: "test" },
+      signal: AbortSignal.timeout(10_000),
+      log: null,
+    });
+    assert.equal(result.response.status, 200);
+    assert.deepEqual(uploads, [
+      {
+        url: "https://uploads.example.test/reference-1",
+        method: "PUT",
+        contentType: "image/png",
+        bytes: png.length,
+      },
+    ]);
+
+    const fileRegistration = JSON.parse(
+      m.calls.bodies[m.calls.urls.indexOf("https://chatgpt.com/backend-api/files")] || "{}"
+    );
+    assert.deepEqual(fileRegistration, {
+      file_name: "reference-1.png",
+      file_size: png.length,
+      mime_type: "image/png",
+      use_case: "multimodal",
+    });
+    assert.ok(
+      m.calls.urls.includes("https://chatgpt.com/backend-api/files/file-reference-1/uploaded"),
+      "upload was finalized before the conversation request"
+    );
+    const conversationIndex = m.calls.urls.findIndex((url) =>
+      url.endsWith("/backend-api/f/conversation")
+    );
+    const conversation = JSON.parse(m.calls.bodies[conversationIndex] || "{}");
+    const userMessage = conversation.messages[conversation.messages.length - 1];
+    assert.equal(userMessage.content.content_type, "multimodal_text");
+    assert.deepEqual(userMessage.content.parts[1], {
+      content_type: "image_asset_pointer",
+      asset_pointer: "file-service://file-reference-1",
+      size_bytes: png.length,
+      width: 2,
+      height: 3,
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
     m.restore();
   }
 });
