@@ -3,8 +3,12 @@ import assert from "node:assert/strict";
 import { writeFile } from "node:fs/promises";
 import type { TlsFetchOptions } from "../../open-sse/services/chatgptTlsClient.ts";
 
-const { ChatGptWebExecutor, __derivePublicBaseUrlForTesting, __resetChatGptWebCachesForTesting } =
-  await import("../../open-sse/executors/chatgpt-web.ts");
+const {
+  ChatGptWebExecutor,
+  __derivePublicBaseUrlForTesting,
+  __resetChatGptWebCachesForTesting,
+  __setAsyncImagePollOverrideForTesting,
+} = await import("../../open-sse/executors/chatgpt-web.ts");
 const { describeChatGptWebHttpError } =
   await import("../../open-sse/executors/chatgptWebErrors.ts");
 const { getExecutor, hasSpecializedExecutor } = await import("../../open-sse/executors/index.ts");
@@ -80,7 +84,7 @@ type MockFetchOptions = {
   fileDownload?: MockTlsConfig;
   attachmentDownload?: MockTlsConfig;
   conversationDetail?: MockTlsConfig | MockTlsConfig[];
-  signedDownload?: MockTlsConfig;
+  signedDownload?: MockTlsConfig | ((url: string) => MockTlsConfig);
   userConfig?: MockTlsConfig;
   referenceUploadHeaders?: Record<string, string>;
   onSession?: (opts: TlsFetchOptions) => void;
@@ -292,7 +296,10 @@ function installMockFetch({
     // image makes it into the cache, surfaced as /v1/chatgpt-web/image/<id>.
     if (/^https:\/\/files\.oaiusercontent\.com\//.test(u)) {
       calls.signedDownload++;
-      const cfg = signedDownload ?? { status: 200 };
+      const cfg =
+        typeof signedDownload === "function"
+          ? signedDownload(u)
+          : (signedDownload ?? { status: 200 });
       if (cfg.status >= 400) {
         return {
           status: cfg.status,
@@ -305,12 +312,13 @@ function installMockFetch({
         0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
         0x52,
       ]);
+      const responseBytes = Buffer.isBuffer(cfg.body) ? cfg.body : tinyPng;
       return {
         status: cfg.status,
         headers: makeHeaders({ "Content-Type": "image/png" }),
         // tls-client-node packages binary bodies as a data:<mime>;base64,...
         // string when isByteResponse is set; the mock mirrors that contract.
-        text: `data:image/png;base64,${tinyPng.toString("base64")}`,
+        text: `data:image/png;base64,${responseBytes.toString("base64")}`,
         body: null,
       };
     }
@@ -3443,6 +3451,134 @@ test("Reference-image echoes are excluded from generated image results", async (
       downloadedFileIds,
       ["file-generated-1"],
       "the uploaded reference must never be returned as the generated Final"
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    m.restore();
+  }
+});
+
+test("Reference-image aliases with different file IDs are rejected by byte hash", async () => {
+  reset();
+  __setAsyncImagePollOverrideForTesting(async () => []);
+  const referencePng = Buffer.from([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03,
+  ]);
+  const m = installMockFetch({
+    conv: {
+      status: 200,
+      events: [
+        { type: "server_ste_metadata", metadata: { turn_use_case: "image gen" } },
+        ...imageGenEvents({ pointer: "file-service://file-reference-alias" }),
+      ],
+    },
+    signedDownload: { status: 200, body: referencePng },
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(null, { status: 200 });
+
+  try {
+    const executor = new ChatGptWebExecutor();
+    const result = await executor.execute({
+      model: "gpt-5.3-instant",
+      body: {
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "Create a new image from this reference" },
+              {
+                type: "image_url",
+                image_url: { url: `data:image/png;base64,${referencePng.toString("base64")}` },
+              },
+            ],
+          },
+        ],
+      },
+      stream: false,
+      credentials: { apiKey: "test" },
+      signal: AbortSignal.timeout(10_000),
+      log: null,
+    });
+    assert.equal(result.response.status, 200);
+    const json = await result.response.json();
+    assert.doesNotMatch(
+      json.choices[0].message.content,
+      /!\[image\]\(/,
+      "reference bytes must never become a successful image result"
+    );
+    assert.equal(m.calls.conv, 1, "must not create another ChatGPT generation turn");
+  } finally {
+    globalThis.fetch = originalFetch;
+    m.restore();
+  }
+});
+
+test("Reference-image alias falls through to async polling and accepts new bytes", async () => {
+  reset();
+  const referencePng = Buffer.from([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03,
+  ]);
+  const generatedPng = Buffer.concat([referencePng, Buffer.from([0x01])]);
+  let pollCount = 0;
+  __setAsyncImagePollOverrideForTesting(async (conversationId) => {
+    pollCount++;
+    assert.equal(conversationId, "conv-img-1");
+    return [{ pointer: "file-service://file-generated-after-alias", messageId: "msg-generated" }];
+  });
+  const m = installMockFetch({
+    conv: {
+      status: 200,
+      events: [
+        { type: "server_ste_metadata", metadata: { turn_use_case: "image gen" } },
+        ...imageGenEvents({ pointer: "file-service://file-reference-alias" }),
+      ],
+    },
+    signedDownload: (url) => ({
+      status: 200,
+      body: url.includes("file-generated-after-alias") ? generatedPng : referencePng,
+    }),
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(null, { status: 200 });
+
+  try {
+    const executor = new ChatGptWebExecutor();
+    const result = await executor.execute({
+      model: "gpt-5.3-instant",
+      body: {
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "Create a new image from this reference" },
+              {
+                type: "image_url",
+                image_url: { url: `data:image/png;base64,${referencePng.toString("base64")}` },
+              },
+            ],
+          },
+        ],
+      },
+      stream: false,
+      credentials: { apiKey: "test" },
+      signal: AbortSignal.timeout(10_000),
+      log: null,
+    });
+    assert.equal(result.response.status, 200);
+    const json = await result.response.json();
+    assert.match(
+      json.choices[0].message.content,
+      /!\[image\]\([^)]*\/v1\/chatgpt-web\/image\/[a-f0-9]+\)/
+    );
+    assert.equal(pollCount, 1, "reuses the existing ChatGPT turn and waits for its async result");
+    assert.equal(m.calls.conv, 1, "must not submit a duplicate generation request");
+    assert.equal(
+      m.calls.signedDownload,
+      2,
+      "checks the alias bytes, then downloads the new result"
     );
   } finally {
     globalThis.fetch = originalFetch;
