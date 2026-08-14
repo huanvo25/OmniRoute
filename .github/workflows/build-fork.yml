@@ -2,7 +2,7 @@ name: Publish Fork Image to GHCR
 
 on:
   push:
-    branches: [main]
+    branches: [release/2a4858026-ghcr-build]
     tags:
       - "v*"
   workflow_dispatch:
@@ -13,12 +13,12 @@ permissions:
   contents: read
 
 env:
-  IMAGE_NAME: ghcr.io/kang-heewon/omniroute
+  IMAGE_NAME: ghcr.io/huanvo25/omniroute
 
 jobs:
   build:
     name: Build and Push Fork Image
-    if: github.repository == 'kang-heewon/OmniRoute'
+    if: github.repository == 'huanvo25/OmniRoute'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -28,9 +28,6 @@ jobs:
         uses: actions/checkout@v7
         with:
           persist-credentials: false
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -63,7 +60,7 @@ jobs:
         with:
           context: .
           target: runner-base
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
