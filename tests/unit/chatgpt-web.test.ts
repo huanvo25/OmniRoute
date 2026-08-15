@@ -1294,6 +1294,9 @@ test("Provider registry: chatgpt-web exposes the current ChatGPT Web model catal
     ids.some((id) => id.startsWith("gpt-5.4")),
     false
   );
+  for (const model of entry.models || []) {
+    assert.equal(model.toolCalling, false, `${model.id} should not advertise tool calling`);
+  }
 
   const { MODEL_MAP } = await import("../../open-sse/executors/chatgpt-web/models.ts");
   assert.equal(

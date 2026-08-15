@@ -36,8 +36,8 @@ test("Codex catalog exposes the GPT-5.6 lineup in configured priority order", ()
   for (const modelId of expectedIds) {
     const model = models.find((entry) => entry.id === modelId);
     assert.ok(model, `codex must expose ${modelId}`);
-    assert.equal(model.contextLength, 500000);
-    assert.equal(model.maxInputTokens, 372000);
+    assert.equal(model.contextLength, 1050000);
+    assert.equal(model.maxInputTokens, 922000);
     assert.equal(model.maxOutputTokens, 128000);
     assert.equal(model.targetFormat, "openai-responses");
     assert.equal(model.toolCalling, true);
@@ -59,4 +59,20 @@ test("Codex catalog no longer exposes GPT-5.4 models", () => {
     models.filter((model) => model.id.startsWith("gpt-5.4")).map((model) => model.id),
     []
   );
+});
+
+test("Codex catalog exposes the live auto-review model", () => {
+  const models = getModelsByProviderId("codex");
+  assert.deepEqual(
+    models.find((model) => model.id === "codex-auto-review"),
+    { id: "codex-auto-review", name: "Codex Auto Review" }
+  );
+});
+
+test("Codex catalog includes GPT-5.2 with its 272K context contract", () => {
+  const model = getModelsByProviderId("codex").find((entry) => entry.id === "gpt-5.2");
+  assert.ok(model);
+  assert.equal(model.contextLength, 272000);
+  assert.equal(model.maxInputTokens, 272000);
+  assert.equal(model.maxOutputTokens, 128000);
 });
