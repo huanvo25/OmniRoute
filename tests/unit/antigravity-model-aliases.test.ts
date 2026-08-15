@@ -16,6 +16,20 @@ function getPublicModel(id: string) {
   return ANTIGRAVITY_PUBLIC_MODELS.find((model) => model.id === id) as any;
 }
 
+test("Antigravity catalog exposes Gemini 3.6 Flash tiers and routes legacy Pro-high", () => {
+  assert.deepEqual(
+    ANTIGRAVITY_PUBLIC_MODELS.slice(0, 3).map((model) => [model.id, model.name]),
+    [
+      ["gemini-3.6-flash-high", "Gemini 3.6 Flash (High)"],
+      ["gemini-3.6-flash-medium", "Gemini 3.6 Flash (Medium)"],
+      ["gemini-3.6-flash-low", "Gemini 3.6 Flash (Low)"],
+    ]
+  );
+  assert.equal(getPublicModel("gemini-3.6-flash-high").contextLength, 1048576);
+  assert.equal(isUserCallableAntigravityModelId("gemini-3.6-flash-low"), true);
+  assert.equal(resolveAntigravityModelId("gemini-3.1-pro-high"), "gemini-pro-agent");
+});
+
 // #3821-review LEDGER-5 — the upstream quota-bucket → client-tier remap is now the single
 // source of truth here (was duplicated as an inline if-ladder in usage.ts). It operates on
 // the UPSTREAM quota namespace, where `gemini-3.5-flash-low` is the Medium tier's bucket.

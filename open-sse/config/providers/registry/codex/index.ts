@@ -142,6 +142,14 @@ export const codexProvider: RegistryEntry = {
       maxOutputTokens: 128000,
     },
     {
+      id: "gpt-5.2",
+      name: "GPT 5.2",
+      ...GPT_5_5_CODEX_CAPABILITIES,
+      contextLength: 272000,
+      maxInputTokens: 272000,
+      maxOutputTokens: 128000,
+    },
+    {
       id: "gpt-5.5-xhigh",
       name: "GPT 5.5 (xHigh)",
       ...GPT_5_5_CODEX_CAPABILITIES,
@@ -178,5 +186,6 @@ export const codexProvider: RegistryEntry = {
       maxOutputTokens: 128000,
     },
     { id: "gpt-5.3-codex-spark", name: "GPT 5.3 Codex Spark" },
+    { id: "codex-auto-review", name: "Codex Auto Review" },
   ],
 };

@@ -1,4 +1,32 @@
 export const ANTIGRAVITY_PUBLIC_MODELS = Object.freeze([
+  // Gemini 3.6 Flash tiers exposed by the current Antigravity model selector.
+  {
+    id: "gemini-3.6-flash-high",
+    name: "Gemini 3.6 Flash (High)",
+    contextLength: 1048576,
+    maxOutputTokens: 65536,
+    supportsReasoning: true,
+    supportsVision: true,
+    toolCalling: true,
+  },
+  {
+    id: "gemini-3.6-flash-medium",
+    name: "Gemini 3.6 Flash (Medium)",
+    contextLength: 1048576,
+    maxOutputTokens: 65536,
+    supportsReasoning: true,
+    supportsVision: true,
+    toolCalling: true,
+  },
+  {
+    id: "gemini-3.6-flash-low",
+    name: "Gemini 3.6 Flash (Low)",
+    contextLength: 1048576,
+    maxOutputTokens: 65536,
+    supportsReasoning: true,
+    supportsVision: true,
+    toolCalling: true,
+  },
   // Claude (Antigravity backend). The `agy` provider already ships these from the live
   // :fetchAvailableModels probe (see agyModels.ts) and discussion #3184 confirmed they
   // are user-callable through the `antigravity` OAuth provider too — same backend.
@@ -159,6 +187,10 @@ export const ANTIGRAVITY_PUBLIC_MODELS = Object.freeze([
 ]);
 
 export const ANTIGRAVITY_MODEL_ALIASES = Object.freeze({
+  // The discovery slot for the Pro-high tier is no longer callable; the live
+  // upstream id is `gemini-pro-agent`. Keep the old public id as a hidden alias
+  // so saved combos continue to work.
+  "gemini-3.1-pro-high": "gemini-pro-agent",
   "gemini-3.5-flash-low": "gemini-3.5-flash-extra-low",
   "gemini-3.5-flash-medium": "gemini-3.5-flash-low",
   "gemini-3.5-flash-high": "gemini-3-flash-agent",

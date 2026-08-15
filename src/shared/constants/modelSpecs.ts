@@ -73,6 +73,14 @@ const GPT_5_6_MODEL_SPEC = {
   supportsVision: true,
 } satisfies ModelSpec;
 
+const GEMINI_35_FLASH_MODEL_SPEC = {
+  maxOutputTokens: 65536,
+  contextWindow: 1048576,
+  supportsThinking: false,
+  supportsTools: true,
+  supportsVision: true,
+} satisfies ModelSpec;
+
 export const MODEL_SPECS: Record<string, ModelSpec> = {
   "gpt-5.6": {
     ...GPT_5_6_MODEL_SPEC,
@@ -138,12 +146,11 @@ export const MODEL_SPECS: Record<string, ModelSpec> = {
     supportsVision: true,
   },
   "gemini-3.5-flash-low": {
-    maxOutputTokens: 65536,
-    contextWindow: 1048576,
-    supportsThinking: false,
-    supportsTools: true,
-    supportsVision: true,
+    ...GEMINI_35_FLASH_MODEL_SPEC,
   },
+  "gemini-3.6-flash-high": { ...GEMINI_35_FLASH_MODEL_SPEC },
+  "gemini-3.6-flash-medium": { ...GEMINI_35_FLASH_MODEL_SPEC },
+  "gemini-3.6-flash-low": { ...GEMINI_35_FLASH_MODEL_SPEC },
 
   // ── Gemini 3 Flash series ───────────────────────────────────────
   "gemini-3-flash": {
