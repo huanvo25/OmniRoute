@@ -1,0 +1,1 @@
+- fix(codex): import newly discovered Codex models through the managed per-connection sync and refresh the dashboard catalog immediately

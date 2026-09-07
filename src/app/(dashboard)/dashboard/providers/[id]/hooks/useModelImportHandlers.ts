@@ -121,6 +121,67 @@ export function useModelImportHandlers({
     });
 
     try {
+      // Connected providers, including Codex, have a managed import endpoint.
+      // It keeps the per-connection discovery cache and aliases in sync. The
+      // previous generic flow created custom-model rows one at a time, which
+      // meant a newly discovered Codex model could appear to import but not
+      // update the catalog currently rendered by the dashboard.
+      if (activeConnection?.id) {
+        const response = await fetch(
+          `/api/providers/${encodeURIComponent(activeConnection.id)}/sync-models?mode=import`,
+          {
+            method: "POST",
+            signal: AbortSignal.timeout(60_000),
+          }
+        );
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.error || t("failedImportModels"));
+        }
+
+        const importedModels = Array.isArray(data.importedModels) ? data.importedModels : [];
+        const importedCount =
+          typeof data.importedCount === "number" ? data.importedCount : importedModels.length;
+        const changedCount =
+          typeof data.importedChanges?.total === "number"
+            ? data.importedChanges.total
+            : importedCount;
+        const totalChangedCount =
+          changedCount +
+          (typeof data.customModelChanges?.total === "number" ? data.customModelChanges.total : 0);
+
+        await Promise.all([fetchAliases(), fetchProviderModelMeta()]);
+
+        setImportProgress((prev) => ({
+          ...prev,
+          phase: "done",
+          total: importedModels.length,
+          current: importedModels.length,
+          status:
+            importedCount > 0
+              ? t("importSuccessCount", { count: importedCount })
+              : totalChangedCount > 0
+                ? t("modelsImported", { count: totalChangedCount })
+                : t("noNewModelsAdded"),
+          logs:
+            importedModels.length > 0
+              ? [
+                  t("foundModelsStartingImport", { count: importedModels.length }),
+                  ...importedModels.map((model: any) =>
+                    t("importingModelById", { modelId: model.id || model.name || model.model })
+                  ),
+                  t("importDoneCount", { count: importedCount }),
+                ]
+              : [
+                  totalChangedCount > 0
+                    ? t("modelsImported", { count: totalChangedCount })
+                    : t("noNewModelsAdded"),
+                ],
+          importedCount,
+        }));
+        return;
+      }
+
       const res = await fetch(`/api/providers/${importTargetId}/models?refresh=true`);
       const data = await res.json();
       if (!res.ok) {
