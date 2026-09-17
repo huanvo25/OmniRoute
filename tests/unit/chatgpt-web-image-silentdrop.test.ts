@@ -16,9 +16,9 @@ import { join } from "node:path";
 process.env.DATA_DIR = mkdtempSync(join(tmpdir(), "omniroute-cgptweb-silentdrop-"));
 
 const { detectImageResolutionFailure } = await import("../../open-sse/executors/chatgpt-web.ts");
-const { handleChatGptWebImageGeneration } = await import(
-  "../../open-sse/handlers/imageGeneration/providers/chatgptWeb.ts"
-);
+const { buildChatGptWebImageRequestArtifact, handleChatGptWebImageGeneration } =
+  await import("../../open-sse/handlers/imageGeneration/providers/chatgptWeb.ts");
+const { getDbInstance } = await import("../../src/lib/db/core.ts");
 
 function fakeExecutor(jsonBody: object, status = 200) {
   return {
@@ -81,6 +81,75 @@ test("handler keeps the generic 502 when no image was generated at all", async (
   assert.match(res.error, /completed without returning image markdown/i);
 });
 
+test("handler maps the ChatGPT Plus image-generation limit to 429", async () => {
+  const quotaText =
+    "You've hit the Plus plan limit for image generations requests. " +
+    "You can create more images when the limit resets in 11 hours and 37 minutes.";
+  const res = await handleChatGptWebImageGeneration({
+    ...baseArgs,
+    executorFactory: () =>
+      fakeExecutor({
+        choices: [{ message: { role: "assistant", content: quotaText } }],
+      }),
+  });
+
+  assert.equal(res.success, false);
+  assert.equal(res.status, 429);
+  assert.match(res.error, /Plus plan limit for image generations/i);
+  assert.equal(res.retrySafe, true);
+});
+
+test("handler maps the ChatGPT Free image-generation limit to 429", async () => {
+  const res = await handleChatGptWebImageGeneration({
+    ...baseArgs,
+    executorFactory: () =>
+      fakeExecutor({
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content:
+                "You've hit the Free plan limit for image generations requests. You can create more images when the limit resets in 6 minutes.",
+            },
+          },
+        ],
+      }),
+  });
+
+  assert.equal(res.success, false);
+  assert.equal(res.status, 429);
+  assert.equal(res.retrySafe, true);
+  assert.match(String(res.error), /Free plan limit/i);
+});
+
+test("handler marks a quota error after an earlier image turn as unsafe to replay", async () => {
+  const imageUrl = "/v1/chatgpt-web/image/abcdef0123456789";
+  let call = 0;
+  const res = await handleChatGptWebImageGeneration({
+    ...baseArgs,
+    body: { prompt: "a kitten", n: 2 },
+    executorFactory: () => ({
+      execute: async () => {
+        call += 1;
+        const content =
+          call === 1
+            ? `![image](${imageUrl})`
+            : "You've hit the Plus plan limit for image generations requests.";
+        return {
+          response: new Response(JSON.stringify({ choices: [{ message: { content } }] }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+        };
+      },
+    }),
+  });
+
+  assert.equal(res.success, false);
+  assert.equal(res.status, 429);
+  assert.equal(res.retrySafe, false);
+});
+
 test("handler returns success when the executor produced image markdown", async () => {
   const url = "/v1/chatgpt-web/image/abcdef0123456789";
   const res = await handleChatGptWebImageGeneration({
@@ -93,4 +162,147 @@ test("handler returns success when the executor produced image markdown", async 
   assert.equal(res.success, true);
   assert.equal(res.data.data.length, 1);
   assert.equal(res.data.data[0].url, url);
+});
+
+test("handler attributes ChatGPT Web image call logs to the selected connection", async () => {
+  const connectionId = "chatgpt-web-image-log-connection";
+  const url = "/v1/chatgpt-web/image/abcdef0123456789";
+  const res = await handleChatGptWebImageGeneration({
+    ...baseArgs,
+    credentials: { apiKey: "sess-cookie", connectionId },
+    executorFactory: () =>
+      fakeExecutor({
+        choices: [{ message: { role: "assistant", content: `![image](${url})` } }],
+      }),
+  });
+
+  assert.equal(res.success, true);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const row = getDbInstance()
+    .prepare("SELECT connection_id, status FROM call_logs WHERE connection_id = ?")
+    .get(connectionId) as { connection_id?: string; status?: number } | undefined;
+  assert.equal(row?.connection_id, connectionId);
+  assert.equal(Number(row?.status), 200);
+});
+
+test("handler attributes failed ChatGPT Web image calls to the selected connection", async () => {
+  const connectionId = "chatgpt-web-image-error-log-connection";
+  const res = await handleChatGptWebImageGeneration({
+    ...baseArgs,
+    credentials: { apiKey: "sess-cookie", connectionId },
+    executorFactory: () =>
+      fakeExecutor({
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: "You've hit the Plus plan limit for image generations requests.",
+            },
+          },
+        ],
+      }),
+  });
+
+  assert.equal(res.success, false);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const row = getDbInstance()
+    .prepare("SELECT connection_id, status FROM call_logs WHERE connection_id = ?")
+    .get(connectionId) as { connection_id?: string; status?: number } | undefined;
+  assert.equal(row?.connection_id, connectionId);
+  assert.equal(Number(row?.status), 429);
+});
+
+test("handler forwards the complete prompt beyond the old 500-character preview boundary", async () => {
+  const url = "/v1/chatgpt-web/image/abcdef0123456789";
+  const tailMarker = "TAIL_COLOR_AND_LAYOUT_INSTRUCTIONS_MUST_REACH_CHATGPT_WEB";
+  const prompt = `${"A".repeat(700)}${tailMarker}`;
+  let forwardedText = "";
+
+  const res = await handleChatGptWebImageGeneration({
+    ...baseArgs,
+    body: { prompt },
+    executorFactory: () => ({
+      execute: async (input) => {
+        forwardedText = input.body.messages[0].content[0].text;
+        return {
+          response: new Response(
+            JSON.stringify({
+              choices: [{ message: { role: "assistant", content: `![image](${url})` } }],
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } }
+          ),
+        };
+      },
+    }),
+  });
+
+  assert.equal(res.success, true);
+  assert.ok(forwardedText.length > 500);
+  assert.match(forwardedText, new RegExp(`${tailMarker}$`));
+});
+
+test("request artifact keeps the complete prompt beyond the old 500-character preview boundary", () => {
+  const tailMarker = "TAIL_VISIBLE_IN_OMNIROUTE_REQUEST_HISTORY";
+  const prompt = `${"B".repeat(700)}${tailMarker}`;
+  const artifact = buildChatGptWebImageRequestArtifact("gpt-4o", prompt, {
+    prompt,
+    size: "1536x1024",
+    quality: "high",
+  });
+
+  assert.equal(artifact.prompt, prompt);
+  assert.match(artifact.prompt, new RegExp(`${tailMarker}$`));
+});
+
+test("handler forwards image_url and image_urls as data-URL message attachments", async () => {
+  const url = "/v1/chatgpt-web/image/abcdef0123456789";
+  let request: { body?: { messages?: Array<{ content?: unknown }> } } | null = null;
+  const res = await handleChatGptWebImageGeneration({
+    ...baseArgs,
+    body: {
+      prompt: "use both references",
+      image_url: "data:image/png;base64,iVBORw0KGgo=",
+      image_urls: ["data:image/jpeg;base64,/9j/4AAQSkY="],
+    },
+    executorFactory: () => ({
+      execute: async (input) => {
+        request = input;
+        return {
+          response: new Response(
+            JSON.stringify({
+              choices: [{ message: { role: "assistant", content: `![image](${url})` } }],
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } }
+          ),
+        };
+      },
+    }),
+  });
+  assert.equal(res.success, true);
+  const content = request?.body?.messages?.[0]?.content;
+  assert.ok(Array.isArray(content));
+  assert.equal(content[0].type, "text");
+  assert.match(content[0].text, /attached reference image/i);
+  assert.deepEqual(
+    content.slice(1).map((part) => part.image_url.url),
+    ["data:image/png;base64,iVBORw0KGgo=", "data:image/jpeg;base64,/9j/4AAQSkY="]
+  );
+});
+
+test("handler rejects non-data-URL references before starting a ChatGPT session", async () => {
+  let called = false;
+  const res = await handleChatGptWebImageGeneration({
+    ...baseArgs,
+    body: { prompt: "use reference", image_url: "https://example.com/reference.png" },
+    executorFactory: () => ({
+      execute: async () => {
+        called = true;
+        throw new Error("should not run");
+      },
+    }),
+  });
+  assert.equal(res.success, false);
+  assert.equal(res.status, 400);
+  assert.match(res.error, /base64 data URLs/i);
+  assert.equal(called, false);
 });

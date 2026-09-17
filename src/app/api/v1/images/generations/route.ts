@@ -3,39 +3,35 @@ import { withInjectionGuard } from "@/middleware/promptInjectionGuard";
 import {
   getProviderCredentialsWithQuotaPreflight,
   clearRecoveredProviderState,
+  extractApiKey,
+  isValidApiKey,
+  markAccountUnavailable,
 } from "@/sse/services/auth";
 import {
   parseImageModel,
   getImageProvider,
   getImageModelEntry,
-  modalitiesRequireImageInput,
 } from "@omniroute/open-sse/config/imageRegistry.ts";
 import { errorResponse, unavailableResponse } from "@omniroute/open-sse/utils/error.ts";
 import { HTTP_STATUS } from "@omniroute/open-sse/config/constants.ts";
-import { isAllRateLimitedCredentials } from "@/app/api/v1/_shared/rateLimit";
 import * as log from "@/sse/utils/logger";
 import { toJsonErrorPayload } from "@/shared/utils/upstreamError";
 import { enforceApiKeyPolicy } from "@/shared/utils/apiKeyPolicy";
 import { v1ImageGenerationSchema } from "@/shared/validation/schemas";
 import { isValidationFailure, validateBody } from "@/shared/validation/helpers";
 
-import { getComboByName } from "@/lib/db/combos";
-import { getAllCustomModels } from "@/lib/db/models";
-import { resolveProxyForConnection } from "@/lib/db/settings";
+import { getAllCustomModels, resolveProxyForConnection } from "@/lib/localDb";
 import { resolveImageRouteModel } from "@/lib/images/imageRouteModel";
-import {
-  resolveLocalSyncedEndpointRoute,
-  type LocalSyncedEndpointRoute,
-} from "@/lib/providerModels/syncedEndpointRouting";
 import { runWithProxyContext } from "@omniroute/open-sse/utils/proxyFetch.ts";
 import { attachOmniRouteMetaHeaders } from "@/domain/omnirouteResponseMeta";
 import { calculateModalCost } from "@/lib/usage/costCalculator";
 import { generateRequestId } from "@/shared/utils/requestId";
 import { getSpecialtyModelsResponse } from "@/app/api/v1/_shared/specialtyCatalog";
-import { enforceClientApiRouteAuth } from "@/shared/utils/clientApiRouteAuth";
-import { runWithCallLogApiKeyContext } from "@/lib/usage/callLogApiKeyContext";
-import { executeImageWithCredentialFallback } from "@/sse/services/imageCredentialRetry";
-import { AUTHZ_HEADER_PEER_LOCALITY } from "@/server/authz/headers";
+import {
+  runImageGenerationAccountLoop,
+  shouldCoolChatGptWebImageAccount,
+  shouldRotateChatGptWebImageAccount,
+} from "@/lib/images/imageAccountFallback";
 
 export const dynamic = "force-dynamic";
 
@@ -98,6 +94,7 @@ function publicBaseUrlHeaders(headers: Headers): Record<string, string> {
 }
 
 async function postHandler(request, context) {
+  const requestId = request.headers.get("x-request-id")?.trim() || generateRequestId();
   let rawBody;
   try {
     rawBody = await request.json();
@@ -111,34 +108,15 @@ async function postHandler(request, context) {
     return errorResponse(HTTP_STATUS.BAD_REQUEST, validation.error.message);
   }
   const body = validation.data;
+  // Private server-side correlation only. Provider handlers persist this in
+  // call_logs so a gen-image candidate can be joined to its exact OmniRoute
+  // attempt without exposing account/connection identifiers to the client.
+  body.__omnirouteCorrelationId = requestId;
   const startTime = Date.now();
-
-  // Authenticate before policy enforcement. Policy checks intentionally allow
-  // keyless local mode and assume the route has already rejected invalid keys.
-  const authRejection = await enforceClientApiRouteAuth(request);
-  if (authRejection) return authRejection;
 
   // Enforce API key policies (model restrictions + budget limits)
   const policy = await enforceApiKeyPolicy(request, body.model);
   if (policy.rejection) return policy.rejection;
-
-  // #9239: Detect combo name and divert to full image combo execution.
-  // Checks before resolveImageRouteModel so we skip single-target flattening.
-  if (body.model && typeof body.model === "string" && !body.model.includes("/")) {
-    const combo = await getComboByName(body.model as string);
-    if (combo) {
-      const { executeImageCombo } = await import(
-        "@omniroute/open-sse/services/imageCombo"
-      );
-      return executeImageCombo(
-        body.model as string,
-        body,
-        { request, policy },
-        startTime,
-        log
-      );
-    }
-  }
 
   // #3205/#3215: resolve a combo/alias name (`image`) or a user-prefixed custom image
   // model (`myImg/gpt-image-2`) to its internal `<nodeId>/<model>` form so the
@@ -147,18 +125,8 @@ async function postHandler(request, context) {
   body.model = await resolveImageRouteModel(body.model);
 
   // Parse model to get provider
-  let { provider, model: requestedModel } = parseImageModel(body.model);
+  let { provider } = parseImageModel(body.model);
   let isCustomModel = false;
-  let syncedEndpointRoute: LocalSyncedEndpointRoute | null = null;
-
-  if (!provider) {
-    syncedEndpointRoute = await resolveLocalSyncedEndpointRoute(body.model, "images");
-    if (syncedEndpointRoute) {
-      provider = syncedEndpointRoute.provider;
-      body.model = `${syncedEndpointRoute.provider}/${syncedEndpointRoute.model}`;
-      isCustomModel = true;
-    }
-  }
 
   // If not in built-in registry, check custom models tagged for images
   if (!provider) {
@@ -172,7 +140,6 @@ async function postHandler(request, context) {
           const fullId = `${providerId}/${model.id}`;
           if (fullId === body.model) {
             provider = providerId;
-            requestedModel = model.id;
             isCustomModel = true;
             break;
           }
@@ -194,13 +161,7 @@ async function postHandler(request, context) {
   const imageModelEntry = getImageModelEntry(body.model);
   const inputModalities = imageModelEntry?.inputModalities || ["text"];
   const requiresPrompt = inputModalities.includes("text");
-  // imageRequired is an explicit registry override for models that list "text" among
-  // their modalities (they accept a prompt) but mechanically require an input image
-  // regardless — e.g. Stability AI's dedicated edit/control/upscale endpoints. Without
-  // it, modalitiesRequireImageInput() would infer "image optional" for any model that
-  // also lists "text", which is wrong for those.
-  const requiresImageInput =
-    Boolean(imageModelEntry?.imageRequired) || modalitiesRequireImageInput(inputModalities);
+  const requiresImageInput = inputModalities.includes("image");
   const hasPrompt = typeof body.prompt === "string" && body.prompt.trim().length > 0;
   const hasImageInput = hasImageGenerationInput(body);
 
@@ -218,115 +179,89 @@ async function postHandler(request, context) {
     );
   }
 
-  // Get credentials — skip for local providers (authType: "none")
+  const requiresCredentials =
+    (providerConfig && providerConfig.authType !== "none") || isCustomModel;
+  const executeWithCredentials = async (credentials) => {
+    let proxyInfo = null;
+    if (credentials?.connectionId) {
+      try {
+        proxyInfo = await resolveProxyForConnection(credentials.connectionId);
+      } catch {
+        log.debug("PROXY", `Failed to resolve proxy for image provider: ${provider}`);
+      }
+    }
+
+    const generateImage = () =>
+      handleImageGeneration({
+        body,
+        credentials,
+        log,
+        ...(isCustomModel && { resolvedProvider: provider }),
+        signal: request.signal,
+        clientHeaders: publicBaseUrlHeaders(request.headers),
+      });
+
+    return credentials?.connectionId
+      ? runWithProxyContext(proxyInfo?.proxy || null, generateImage).catch((err: any) => ({
+          success: false,
+          status: err.statusCode || 500,
+          error: err.message,
+        }))
+      : generateImage();
+  };
+
   let credentials = null;
-  if (providerConfig && providerConfig.authType !== "none") {
-    credentials = await getProviderCredentialsWithQuotaPreflight(
-      provider,
-      null,
-      null,
-      requestedModel
-    );
-    if (!credentials) {
+  let result;
+  if (!requiresCredentials) {
+    result = await executeWithCredentials(null);
+  } else {
+    const outcome = await runImageGenerationAccountLoop({
+      selectCredentials: (excludedConnectionIds) =>
+        getProviderCredentialsWithQuotaPreflight(provider, null, null, body.model, {
+          excludeConnectionIds: excludedConnectionIds,
+        }),
+      execute: executeWithCredentials,
+      shouldRotate: (failedResult, selectedCredentials) =>
+        providerConfig?.format === "chatgpt-web" &&
+        shouldRotateChatGptWebImageAccount(failedResult) &&
+        Boolean(selectedCredentials?.connectionId),
+      shouldMarkUnavailable: (failedResult, selectedCredentials) =>
+        providerConfig?.format === "chatgpt-web" &&
+        shouldCoolChatGptWebImageAccount(failedResult) &&
+        Boolean(selectedCredentials?.connectionId),
+      markUnavailable: (selectedCredentials, failedResult) =>
+        markAccountUnavailable(
+          selectedCredentials.connectionId as string,
+          failedResult.status ?? HTTP_STATUS.BAD_GATEWAY,
+          typeof failedResult.error === "string"
+            ? failedResult.error
+            : JSON.stringify(failedResult.error),
+          provider,
+          body.model
+        ),
+      clearRecoveredState: clearRecoveredProviderState,
+    });
+
+    if (outcome.kind === "no_credentials") {
       return errorResponse(
         HTTP_STATUS.BAD_REQUEST,
-        `No credentials for image provider: ${provider}`
+        `No credentials for ${isCustomModel ? "custom " : ""}image provider: ${provider}`
       );
     }
-    if (credentials.allRateLimited) {
+    if (outcome.kind === "all_rate_limited") {
       return unavailableResponse(
         HTTP_STATUS.RATE_LIMITED,
         `[${provider}] All accounts rate limited`,
-        credentials.retryAfter,
-        credentials.retryAfterHuman
+        outcome.credentials.retryAfter,
+        outcome.credentials.retryAfterHuman
       );
     }
-  } else if (isCustomModel) {
-    credentials = await getProviderCredentialsWithQuotaPreflight(
-      provider,
-      null,
-      syncedEndpointRoute?.connectionIds ?? null,
-      requestedModel    );
-    if (!credentials) {
-      return errorResponse(
-        HTTP_STATUS.BAD_REQUEST,
-        `No credentials for custom image provider: ${provider}`
-      );
-    }
-    if (credentials.allRateLimited) {
-      return unavailableResponse(
-        HTTP_STATUS.RATE_LIMITED,
-        `[${provider}] All accounts rate limited`,
-        credentials.retryAfter,
-        credentials.retryAfterHuman
-      );
-    }
-  } else if (providerConfig && providerConfig.authType === "none") {
-    // #6928: best-effort per-connection base-URL override lookup for local
-    // no-auth media providers (ComfyUI). A connection is optional here — unlike
-    // the authType !== "none" branch above, we never 400 when none exists.
-    const localCredentials = await getProviderCredentialsWithQuotaPreflight(
-      provider,
-      null,
-      null,
-      requestedModel
-    );
-    if (localCredentials && !isAllRateLimitedCredentials(localCredentials)) {
-      credentials = localCredentials;
-    }
+    credentials = outcome.credentials;
+    result = outcome.result;
   }
 
-  const execution = await executeImageWithCredentialFallback({
-    provider,
-    requestedModel,
-    credentials,
-    execute: async (attemptCredentials) => {
-      let proxyInfo = null;
-      if (attemptCredentials?.connectionId) {
-        try {
-          proxyInfo = await resolveProxyForConnection(attemptCredentials.connectionId);
-        } catch {
-          log.debug("PROXY", `Failed to resolve proxy for image provider: ${provider}`);
-        }
-      }
-
-      const generateImage = () =>
-        runWithCallLogApiKeyContext(
-          {
-            apiKeyId: policy.apiKeyInfo?.id ?? null,
-            apiKeyName: policy.apiKeyInfo?.name ?? null,
-          },
-          () =>
-            handleImageGeneration({
-              body,
-              credentials: attemptCredentials,
-              log,
-              ...(isCustomModel && { resolvedProvider: provider }),
-              signal: request.signal,
-              clientHeaders: publicBaseUrlHeaders(request.headers),
-              // Trusted "loopback"|"lan"|"remote" verdict stamped by the authz
-              // pipeline from the real TCP peer (never the spoofable Host
-              // header). Only the spawn-capable cursor-agent-image provider
-              // consumes this (Hard Rules #15 + #17) — every other image
-              // provider ignores it.
-              peerLocality: request.headers.get(AUTHZ_HEADER_PEER_LOCALITY),
-            })
-        );
-
-      return attemptCredentials?.connectionId
-        ? runWithProxyContext(proxyInfo?.proxy || null, generateImage).catch((err: any) => ({
-            success: false,
-            status: err.statusCode || 500,
-            error: err.message,
-          }))
-        : generateImage();
-    },
-  });
-  credentials = execution.credentials;
-  const result = execution.result;
-
   if (result.success) {
-    await clearRecoveredProviderState(credentials);
+    if (!requiresCredentials) await clearRecoveredProviderState(credentials);
     const n = Math.max(
       Number(body.n) || 1,
       (result as { data?: { data?: unknown[] } }).data?.data?.length || 0
@@ -338,22 +273,29 @@ async function postHandler(request, context) {
       model: body.model,
       costUsd,
       latencyMs: Date.now() - startTime,
-      requestId: generateRequestId(),
+      requestId,
     });
+    if ((result as any).upstreamConversationId) {
+      headers.set("X-ChatGPT-Conversation-Id", String((result as any).upstreamConversationId));
+    }
     return new Response(JSON.stringify((result as { data: unknown }).data), {
       status: 200,
       headers,
     });
   }
 
-  const errorPayload = toJsonErrorPayload((result as any).error, "Image generation provider error") as {
-    error?: { message?: string };
-  };
-  const message =
-    typeof errorPayload?.error?.message === "string"
-      ? errorPayload.error.message
-      : "Image generation provider error";
-  return errorResponse((result as any).status, message);
+  const errorPayload = toJsonErrorPayload((result as any).error, "Image generation provider error");
+  const errorHeaders = new Headers({
+    "Content-Type": "application/json",
+    "X-OmniRoute-Request-Id": requestId,
+  });
+  if ((result as any).upstreamConversationId) {
+    errorHeaders.set("X-ChatGPT-Conversation-Id", String((result as any).upstreamConversationId));
+  }
+  return new Response(JSON.stringify(errorPayload), {
+    status: (result as any).status,
+    headers: errorHeaders,
+  });
 }
 
 export const POST = withInjectionGuard(postHandler);
