@@ -1,6 +1,6 @@
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/error.ts";
 
-import { getProviderCredentialsWithQuotaPreflight } from "./auth";
+import { getProviderCredentialsWithQuotaPreflight, markAccountUnavailable } from "./auth";
 import { checkAndRefreshToken } from "./tokenRefresh";
 import * as log from "../utils/logger";
 
@@ -48,6 +48,13 @@ function connectionIdOf(credentials: any): string | null {
 
 function isCredentialSentinel(credentials: any): boolean {
   return Boolean(credentials?.allRateLimited || credentials?.allExpired);
+}
+
+const CHATGPT_WEB_IMAGE_QUOTA_RE = /(?:plus|free) plan limit for image generations?\s+requests?/i;
+
+function isChatGptWebImageQuotaFailure(provider: string, result: ImageGenerationResult): boolean {
+  if (provider !== "chatgpt-web" || Number(result.status) !== 429) return false;
+  return CHATGPT_WEB_IMAGE_QUOTA_RE.test(String(result.error || ""));
 }
 
 async function defaultSelectNextCredentials(
@@ -111,8 +118,19 @@ export async function executeImageWithCredentialFallback({
     lastCredentials = currentCredentials;
     lastResult = await execute(currentCredentials);
     const isAuthFailure = Number(lastResult.status) === 401 || lastResult.retryable === true;
-    if (lastResult.success || !isAuthFailure || !connectionId) {
+    const isQuotaFailure = isChatGptWebImageQuotaFailure(provider, lastResult);
+    if (lastResult.success || (!isAuthFailure && !isQuotaFailure) || !connectionId) {
       return { credentials: lastCredentials, result: lastResult };
+    }
+
+    if (isQuotaFailure) {
+      await markAccountUnavailable(
+        connectionId,
+        429,
+        String(lastResult.error || "ChatGPT Web image quota exhausted"),
+        provider,
+        requestedModel
+      );
     }
 
     log.warn("IMAGE", "Image provider rejected credentials; trying another account", {

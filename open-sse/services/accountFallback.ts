@@ -1302,6 +1302,16 @@ export function parseRetryFromErrorText(errorText: unknown): number | null {
     return computeDurationMs(resetsInMatch);
   }
 
+  // ChatGPT Web: "The Free plan limit ... resets in 6 minutes."
+  const naturalResetMatch = /resets? in\s+(\d+)\s*(minutes?|mins?|hours?|hrs?)/i.exec(msg);
+  if (naturalResetMatch) {
+    const amount = Number(naturalResetMatch[1]);
+    const unit = naturalResetMatch[2].toLowerCase();
+    if (Number.isFinite(amount) && amount > 0) {
+      return amount * (unit.startsWith("h") ? 60 * 60 * 1000 : 60 * 1000);
+    }
+  }
+
   // Gemini phrasing: "Please retry in 54.472178091s" (fractional seconds).
   const retryInSecMatch = /please retry in (\d+(?:\.\d+)?)\s*s/i.exec(msg);
   if (retryInSecMatch?.[1]) {

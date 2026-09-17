@@ -9,6 +9,7 @@ import { saveImageErrorResult, saveImageSuccessResult } from "../../imageGenerat
 export const CHATGPT_WEB_IMAGE_MARKDOWN_RE = /!\[[^\]]*\]\(([^)\s]+)\)/g;
 export const CHATGPT_WEB_IMAGE_ID_RE =
   /\/v1\/chatgpt-web\/image\/([a-f0-9]{16,64})(?=[?\s"'<>)]|$)/i;
+const CHATGPT_WEB_IMAGE_QUOTA_RE = /(?:plus|free) plan limit for image generations?\s+requests?/i;
 
 export function extractMarkdownImageUrls(text: string): string[] {
   const urls: string[] = [];
@@ -138,6 +139,17 @@ export async function handleChatGptWebImageGeneration({
 
     const urls = extractMarkdownImageUrls(content);
     if (urls.length === 0) {
+      if (CHATGPT_WEB_IMAGE_QUOTA_RE.test(content)) {
+        return saveImageErrorResult({
+          provider,
+          model,
+          status: 429,
+          startTime,
+          error: content,
+          requestBody,
+          retryable: true,
+        });
+      }
       // Distinguish "image was generated upstream but OmniRoute could not
       // retrieve it" (executor flagged the unresolved asset pointer) from
       // "no image was produced at all" — the former is our bug/limitation,
