@@ -947,7 +947,11 @@ async function uploadReferenceImages(
       throw new ReferenceImageUploadError("ChatGPT Web could not prepare a reference image upload");
     }
 
-    let registrationBody: { file_id?: unknown; upload_url?: unknown };
+    let registrationBody: {
+      file_id?: unknown;
+      upload_url?: unknown;
+      upload_headers?: unknown;
+    };
     try {
       registrationBody = JSON.parse(registration.text || "{}");
     } catch {
@@ -964,11 +968,26 @@ async function uploadReferenceImages(
       );
     }
 
+    // The signed upload URL may require provider-specific headers returned
+    // by ChatGPT. Omitting them causes Azure/S3 signature validation to fail.
+    const uploadHeaders = new Headers();
+    if (registrationBody.upload_headers && typeof registrationBody.upload_headers === "object") {
+      for (const [key, value] of Object.entries(registrationBody.upload_headers)) {
+        if (typeof value === "string") uploadHeaders.set(key, value);
+      }
+    }
+    if (!uploadHeaders.has("content-type")) uploadHeaders.set("content-type", image.mimeType);
+    if (!uploadHeaders.has("x-ms-blob-type")) uploadHeaders.set("x-ms-blob-type", "BlockBlob");
+    if (!uploadHeaders.has("x-ms-version")) uploadHeaders.set("x-ms-version", "2020-04-08");
+    if (!uploadHeaders.has("content-length")) {
+      uploadHeaders.set("content-length", String(image.bytes.length));
+    }
+
     let putResponse: Response;
     try {
       putResponse = await fetch(uploadUrl, {
         method: "PUT",
-        headers: { "Content-Type": image.mimeType },
+        headers: uploadHeaders,
         body: image.bytes,
         signal: signal ?? undefined,
       });
@@ -976,7 +995,13 @@ async function uploadReferenceImages(
       throw new ReferenceImageUploadError("ChatGPT Web could not upload a reference image");
     }
     if (!putResponse.ok) {
-      throw new ReferenceImageUploadError("ChatGPT Web rejected a reference image upload");
+      const responseText = await putResponse.text().catch(() => "");
+      const xmlCode = /<Code>([A-Za-z0-9_.-]{1,80})<\/Code>/i.exec(responseText)?.[1];
+      throw new ReferenceImageUploadError(
+        `ChatGPT Web rejected a reference image upload (HTTP ${putResponse.status}${
+          xmlCode ? `, ${xmlCode}` : ""
+        })`
+      );
     }
 
     const confirmation = await tlsFetchChatGpt(
