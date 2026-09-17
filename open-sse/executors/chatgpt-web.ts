@@ -35,6 +35,7 @@ import {
 import { isThinkingCapableModel, resolveChatGptModel } from "./chatgpt-web/models.ts";
 import { cleanChatGptText } from "./chatgpt-web/citations.ts";
 import { resumeChatGptHandoff, type FinalAssistantAnswer } from "./chatgpt-web/handoff.ts";
+import { fetchRemoteImage } from "@/shared/network/remoteImageFetch";
 
 // ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -880,7 +881,9 @@ function parseOpenAIMessages(messages: Array<Record<string, unknown>>): ParsedMe
               : imageUrl && typeof imageUrl === "object" && typeof imageUrl.url === "string"
                 ? imageUrl.url
                 : null;
-          if (url?.startsWith("data:image/")) referenceImages.push(url);
+          if (url?.startsWith("data:image/") || /^https?:\/\//i.test(url || "")) {
+            referenceImages.push(url);
+          }
           return false;
         })
         .map((c) => String(c.text || ""))
@@ -931,6 +934,34 @@ function parseReferenceImageDataUrl(dataUrl: string): { mimeType: string; bytes:
   const bytes = Buffer.from(match[2], "base64");
   if (bytes.length === 0 || bytes.length > MAX_REFERENCE_IMAGE_BYTES) return null;
   return { mimeType: match[1].toLowerCase(), bytes };
+}
+
+function normalizeReferenceImageMimeType(contentType: string): string | null {
+  const mimeType = contentType.split(";", 1)[0]?.trim().toLowerCase();
+  return mimeType && /^(image\/(?:png|jpe?g|webp|gif))$/.test(mimeType) ? mimeType : null;
+}
+
+async function loadReferenceImage(
+  source: string
+): Promise<{ mimeType: string; bytes: Buffer } | null> {
+  const dataUrl = parseReferenceImageDataUrl(source);
+  if (dataUrl) return dataUrl;
+
+  let url: URL;
+  try {
+    url = new URL(source);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "https:" && url.protocol !== "http:") return null;
+
+  try {
+    const remoteImage = await fetchRemoteImage(url, { maxBytes: MAX_REFERENCE_IMAGE_BYTES });
+    const mimeType = normalizeReferenceImageMimeType(remoteImage.contentType);
+    return mimeType ? { mimeType, bytes: remoteImage.buffer } : null;
+  } catch {
+    return null;
+  }
 }
 
 function imageDimensions(bytes: Buffer, mimeType: string): { width?: number; height?: number } {
@@ -987,26 +1018,26 @@ class ReferenceImageUploadError extends Error {
 }
 
 async function uploadReferenceImages(
-  dataUrls: string[],
+  sources: string[],
   headers: Record<string, string>,
   signal: AbortSignal | null | undefined
 ): Promise<UploadedReferenceImage[]> {
-  if (dataUrls.length === 0) return [];
-  if (dataUrls.length > MAX_REFERENCE_IMAGES) {
+  if (sources.length === 0) return [];
+  if (sources.length > MAX_REFERENCE_IMAGES) {
     throw new ReferenceImageUploadError(
       `ChatGPT Web supports at most ${MAX_REFERENCE_IMAGES} reference images per generation`,
       400
     );
   }
 
-  const sources = dataUrls.map(parseReferenceImageDataUrl);
-  if (sources.some((source) => !source)) {
+  const resolvedSources = await Promise.all(sources.map(loadReferenceImage));
+  if (resolvedSources.some((source) => !source)) {
     throw new ReferenceImageUploadError(
-      "ChatGPT Web reference images must be PNG, JPEG, WEBP, or GIF base64 data URLs",
+      "ChatGPT Web reference images must be valid PNG, JPEG, WEBP, or GIF data URLs or HTTP(S) URLs",
       400
     );
   }
-  const images = sources as Array<{ mimeType: string; bytes: Buffer }>;
+  const images = resolvedSources as Array<{ mimeType: string; bytes: Buffer }>;
   if (
     images.reduce((total, image) => total + image.bytes.length, 0) > MAX_REFERENCE_IMAGE_TOTAL_BYTES
   ) {

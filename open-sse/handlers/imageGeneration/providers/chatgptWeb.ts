@@ -18,8 +18,9 @@ const CHATGPT_WEB_IMAGE_QUOTA_RE = /(?:plus|free) plan limit for image generatio
 
 /**
  * Extract the OpenAI-compatible reference-image fields accepted by image
- * generation. ChatGPT Web needs these as data URLs because it uploads them
- * to the user's ChatGPT conversation before asking image_gen to run.
+ * generation. ChatGPT Web uploads them to the user's ChatGPT conversation
+ * before asking image_gen to run. The executor safely fetches HTTP(S) sources
+ * and uploads their bytes, so clients can use either data URLs or image URLs.
  */
 export function extractChatGptWebReferenceImages(body: Record<string, unknown>): {
   images: string[];
@@ -35,33 +36,40 @@ export function extractChatGptWebReferenceImages(body: Record<string, unknown>):
   for (const candidate of candidates) {
     if (candidate == null) continue;
     if (typeof candidate !== "string") {
-      return { images: [], error: "ChatGPT Web reference images must be base64 data URLs" };
+      return {
+        images: [],
+        error: "ChatGPT Web reference images must be data URLs or HTTP(S) URLs",
+      };
     }
 
     const value = candidate.trim();
     if (!value || seen.has(value)) continue;
     const match = IMAGE_DATA_URL_RE.exec(value);
-    if (!match) {
+    const isHttpUrl = /^https?:\/\//i.test(value);
+    if (!match && !isHttpUrl) {
       return {
         images: [],
-        error: "ChatGPT Web reference images must be PNG, JPEG, WEBP, or GIF base64 data URLs",
+        error:
+          "ChatGPT Web reference images must be PNG, JPEG, WEBP, or GIF data URLs or HTTP(S) URLs",
       };
     }
 
-    const base64 = match[2];
-    const byteLength = Buffer.byteLength(base64, "base64");
-    if (byteLength === 0 || byteLength > MAX_REFERENCE_IMAGE_BYTES) {
-      return {
-        images: [],
-        error: `Each ChatGPT Web reference image must be at most ${MAX_REFERENCE_IMAGE_BYTES / 1024 / 1024} MB`,
-      };
-    }
-    totalBytes += byteLength;
-    if (totalBytes > MAX_REFERENCE_IMAGE_TOTAL_BYTES) {
-      return {
-        images: [],
-        error: `ChatGPT Web reference images must total at most ${MAX_REFERENCE_IMAGE_TOTAL_BYTES / 1024 / 1024} MB`,
-      };
+    if (match) {
+      const base64 = match[2];
+      const byteLength = Buffer.byteLength(base64, "base64");
+      if (byteLength === 0 || byteLength > MAX_REFERENCE_IMAGE_BYTES) {
+        return {
+          images: [],
+          error: `Each ChatGPT Web reference image must be at most ${MAX_REFERENCE_IMAGE_BYTES / 1024 / 1024} MB`,
+        };
+      }
+      totalBytes += byteLength;
+      if (totalBytes > MAX_REFERENCE_IMAGE_TOTAL_BYTES) {
+        return {
+          images: [],
+          error: `ChatGPT Web reference images must total at most ${MAX_REFERENCE_IMAGE_TOTAL_BYTES / 1024 / 1024} MB`,
+        };
+      }
     }
     images.push(value);
     seen.add(value);

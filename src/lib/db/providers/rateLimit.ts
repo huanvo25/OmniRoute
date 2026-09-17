@@ -127,20 +127,16 @@ export function getEffectiveQuotaUsage(
 /**
  * T05: Startup crash-recovery — clear stale transient connection cooldowns.
  *
- * After an unclean crash (SIGKILL, OOM-kill, large-body burst) the normal
- * error-handler paths that would clear/normalise cooldowns never run.
- * A connection's `rate_limited_until` may have been pushed far into the
- * future by exponential back-off.  On next startup that leaves all affected
- * connections excluded by `getProviderCredentials()`, so every request sits
- * in the Bottleneck queue and times out at `maxWaitMs` (120 s default).
+ * Clears naturally expired cooldowns after an unclean crash. A valid future
+ * `rate_limited_until` is authoritative account-limit state and must survive
+ * a restart; otherwise an exhausted account is selected again immediately.
  *
  * Safe invariants:
  *  - Only connections with `rate_limited_until IS NOT NULL` are touched.
  *  - Terminal states (`banned`, `expired`, `credits_exhausted`) are skipped —
  *    those require a deliberate credential change or operator reset.
- *  - Past timestamps are also cleared: they are already expired in the lazy
- *    expiry sense, but clearing them resets `backoffLevel` / transient error
- *    fields so the connection gets a clean slate on this fresh process.
+ *  - Only expired timestamps are cleared. Future timestamps remain intact
+ *    until their advertised reset time.
  *
  * Must be called once, early in the startup sequence, before any request
  * is handled.  Returns the number of connections that were cleared.
@@ -148,21 +144,30 @@ export function getEffectiveQuotaUsage(
 export function clearStaleCrashCooldowns(): { cleared: number } {
   const db = getDbInstance() as unknown as DbLike;
   const now = new Date().toISOString();
+  const nowMs = Date.now();
 
   // Fetch all connections that have a rate_limited_until set and are NOT in
-  // a terminal state.  We do the terminal-status filter in JS to reuse the
-  // canonical `TERMINAL_STATUSES` set rather than duplicating the list in SQL.
+  // a terminal state. We do the expiry and terminal-status filters in JS so
+  // numeric SQLite timestamps and ISO strings are handled consistently.
   const TERMINAL_STATUSES = new Set(["banned", "expired", "credits_exhausted"]);
 
   const rows = db
     .prepare(
-      `SELECT id, test_status FROM provider_connections WHERE rate_limited_until IS NOT NULL`
+      `SELECT id, test_status, rate_limited_until FROM provider_connections WHERE rate_limited_until IS NOT NULL`
     )
-    .all() as Array<{ id: string; test_status: string | null }>;
+    .all() as Array<{
+    id: string;
+    test_status: string | null;
+    rate_limited_until: string | number;
+  }>;
 
   const toReset = rows.filter((r) => {
     const status = (r.test_status || "").trim().toLowerCase();
-    return !TERMINAL_STATUSES.has(status);
+    if (TERMINAL_STATUSES.has(status)) return false;
+    const raw = r.rate_limited_until;
+    const until =
+      typeof raw === "number" ? raw : /^\d+(\.\d+)?$/.test(raw) ? Number(raw) : Date.parse(raw);
+    return !Number.isFinite(until) || until <= nowMs;
   });
 
   if (toReset.length === 0) return { cleared: 0 };
