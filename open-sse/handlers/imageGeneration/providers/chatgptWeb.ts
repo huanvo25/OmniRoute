@@ -10,6 +10,64 @@ export const CHATGPT_WEB_IMAGE_MARKDOWN_RE = /!\[[^\]]*\]\(([^)\s]+)\)/g;
 export const CHATGPT_WEB_IMAGE_ID_RE =
   /\/v1\/chatgpt-web\/image\/([a-f0-9]{16,64})(?=[?\s"'<>)]|$)/i;
 const CHATGPT_WEB_IMAGE_QUOTA_RE = /(?:plus|free) plan limit for image generations?\s+requests?/i;
+const MAX_REFERENCE_IMAGES = 4;
+const MAX_REFERENCE_IMAGE_BYTES = 10 * 1024 * 1024;
+const MAX_REFERENCE_IMAGE_TOTAL_BYTES = 20 * 1024 * 1024;
+const IMAGE_DATA_URL_RE = /^data:(image\/(?:png|jpe?g|webp|gif));base64,([A-Za-z0-9+/]+={0,2})$/i;
+
+export function extractChatGptWebReferenceImages(body: Record<string, unknown>): {
+  images: string[];
+  error?: string;
+} {
+  const candidates: unknown[] = [body.image_url];
+  if (Array.isArray(body.image_urls)) candidates.push(...body.image_urls);
+
+  const images: string[] = [];
+  const seen = new Set<string>();
+  let totalBytes = 0;
+
+  for (const candidate of candidates) {
+    if (candidate == null) continue;
+    if (typeof candidate !== "string") {
+      return { images: [], error: "ChatGPT Web reference images must be base64 data URLs" };
+    }
+
+    const value = candidate.trim();
+    if (!value || seen.has(value)) continue;
+    const match = IMAGE_DATA_URL_RE.exec(value);
+    if (!match) {
+      return {
+        images: [],
+        error: "ChatGPT Web reference images must be PNG, JPEG, WEBP, or GIF base64 data URLs",
+      };
+    }
+
+    const byteLength = Buffer.byteLength(match[2], "base64");
+    if (byteLength === 0 || byteLength > MAX_REFERENCE_IMAGE_BYTES) {
+      return {
+        images: [],
+        error: `Each ChatGPT Web reference image must be at most ${MAX_REFERENCE_IMAGE_BYTES / 1024 / 1024} MB`,
+      };
+    }
+    totalBytes += byteLength;
+    if (totalBytes > MAX_REFERENCE_IMAGE_TOTAL_BYTES) {
+      return {
+        images: [],
+        error: `ChatGPT Web reference images must total at most ${MAX_REFERENCE_IMAGE_TOTAL_BYTES / 1024 / 1024} MB`,
+      };
+    }
+    images.push(value);
+    seen.add(value);
+    if (images.length > MAX_REFERENCE_IMAGES) {
+      return {
+        images: [],
+        error: `ChatGPT Web supports at most ${MAX_REFERENCE_IMAGES} reference images per generation`,
+      };
+    }
+  }
+
+  return { images };
+}
 
 export function extractMarkdownImageUrls(text: string): string[] {
   const urls: string[] = [];
@@ -24,6 +82,11 @@ export function extractMarkdownImageUrls(text: string): string[] {
 export function buildChatGptWebImagePrompt(body): string {
   const prompt = String(body.prompt || "").trim();
   const details: string[] = [`Create an image for this prompt: ${prompt}`];
+  if (Array.isArray(body.reference_images) && body.reference_images.length > 0) {
+    details.push(
+      "Use the attached reference image(s) as visual context while following the prompt."
+    );
+  }
   if (typeof body.size === "string" && body.size.trim()) {
     details.push(`Requested size: ${body.size.trim()}.`);
   }
@@ -34,6 +97,19 @@ export function buildChatGptWebImagePrompt(body): string {
     details.push(`Requested style: ${body.style.trim()}.`);
   }
   return details.join("\n");
+}
+
+export function buildChatGptWebImageRequestArtifact(
+  model: string,
+  prompt: string,
+  body: Record<string, unknown>
+) {
+  return {
+    model,
+    prompt,
+    size: body.size || undefined,
+    quality: body.quality || undefined,
+  };
 }
 
 export async function handleChatGptWebImageGeneration({
@@ -93,20 +169,42 @@ export async function handleChatGptWebImageGeneration({
   }
 
   const wantsBase64 = body.response_format === "b64_json";
+  const referenceImages = extractChatGptWebReferenceImages(body);
+  if (referenceImages.error) {
+    return saveImageErrorResult({
+      provider,
+      model,
+      status: 400,
+      startTime,
+      error: referenceImages.error,
+    });
+  }
   const images: Array<{ url?: string; b64_json?: string }> = [];
-  const requestBody = {
-    model,
-    prompt: prompt.slice(0, 500),
-    size: body.size || undefined,
-    quality: body.quality || undefined,
-  };
+  const requestBody = buildChatGptWebImageRequestArtifact(model, prompt, body);
 
   for (let i = 0; i < requestedCount; i++) {
     const executor = executorFactory();
     const result = await executor.execute({
       model,
       body: {
-        messages: [{ role: "user", content: buildChatGptWebImagePrompt(body) }],
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text: buildChatGptWebImagePrompt({
+                  ...body,
+                  reference_images: referenceImages.images,
+                }),
+              },
+              ...referenceImages.images.map((url) => ({
+                type: "image_url",
+                image_url: { url },
+              })),
+            ],
+          },
+        ],
       },
       stream: false,
       credentials,

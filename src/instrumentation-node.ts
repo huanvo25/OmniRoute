@@ -293,10 +293,9 @@ export async function registerNodejs(): Promise<void> {
     ),
   ]);
 
-  // Clear stale transient connection cooldowns persisted from an unclean crash.
-  // A crash mid-burst can leave far-future `rate_limited_until` values in the DB
-  // that cause every connection to be skipped by getProviderCredentials(), making
-  // all subsequent requests time out at Bottleneck's maxWaitMs (120 s default).
+  // Clear only expired or malformed transient connection cooldowns persisted
+  // from an unclean crash. Valid future `rate_limited_until` values represent
+  // an active upstream account limit and must survive restarts until expiry.
   // Terminal states (banned / expired / credits_exhausted) are intentionally kept.
   // See: https://github.com/diegosouzapw/OmniRoute/issues/3625 (Part A)
   try {

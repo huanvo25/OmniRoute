@@ -47,6 +47,12 @@ const SESSION_URL = `${CHATGPT_BASE}/api/auth/session`;
 const SENTINEL_PREPARE_URL = `${CHATGPT_BASE}/backend-api/sentinel/chat-requirements/prepare`;
 const SENTINEL_CR_URL = `${CHATGPT_BASE}/backend-api/sentinel/chat-requirements`;
 const CONV_URL = `${CHATGPT_BASE}/backend-api/f/conversation`;
+const FILES_URL = `${CHATGPT_BASE}/backend-api/files`;
+
+const MAX_REFERENCE_IMAGE_BYTES = 10 * 1024 * 1024;
+const MAX_REFERENCE_IMAGE_TOTAL_BYTES = 20 * 1024 * 1024;
+const MAX_REFERENCE_IMAGES = 4;
+const IMAGE_DATA_URL_RE = /^data:(image\/(?:png|jpe?g|webp|gif));base64,([A-Za-z0-9+/]+={0,2})$/i;
 const DEFAULT_PRO_POLL_TIMEOUT_MS = 20 * 60_000;
 const DEFAULT_PRO_POLL_INTERVAL_MS = 4_000;
 
@@ -724,6 +730,7 @@ interface ParsedMessages {
   systemMsg: string;
   history: Array<{ role: string; content: string }>;
   currentMsg: string;
+  currentReferenceImages: string[];
   latestImageContext: ChatGptImageConversationContext | null;
 }
 
@@ -766,29 +773,43 @@ function parseOpenAIMessages(messages: Array<Record<string, unknown>>): ParsedMe
   let systemMsg = "";
   const history: Array<{ role: string; content: string }> = [];
   let latestImageContext: ChatGptImageConversationContext | null = null;
+  let currentReferenceImages: string[] = [];
 
   for (const msg of messages) {
     let role = String(msg.role || "user");
     if (role === "developer") role = "system";
 
     let content = "";
+    const referenceImages: string[] = [];
     if (typeof msg.content === "string") {
       content = msg.content;
     } else if (Array.isArray(msg.content)) {
       content = (msg.content as Array<Record<string, unknown>>)
-        .filter((c) => c.type === "text")
+        .filter((c) => {
+          if (c.type !== "image_url") return c.type === "text";
+          const imageUrl = c.image_url;
+          const url =
+            typeof imageUrl === "string"
+              ? imageUrl
+              : imageUrl && typeof imageUrl === "object" && typeof imageUrl.url === "string"
+                ? imageUrl.url
+                : null;
+          if (url?.startsWith("data:image/")) referenceImages.push(url);
+          return false;
+        })
         .map((c) => String(c.text || ""))
         .join(" ");
     }
     content = stripInlinedImages(content);
     const imageContext = findCachedImageContext(content);
     if (imageContext) latestImageContext = imageContext;
-    if (!content.trim()) continue;
+    if (!content.trim() && referenceImages.length === 0) continue;
 
     if (role === "system") {
       systemMsg += (systemMsg ? "\n" : "") + content;
     } else if (role === "user" || role === "assistant") {
       history.push({ role, content });
+      if (role === "user") currentReferenceImages = referenceImages;
     }
   }
 
@@ -797,14 +818,191 @@ function parseOpenAIMessages(messages: Array<Record<string, unknown>>): ParsedMe
     currentMsg = history.pop()!.content;
   }
 
-  return { systemMsg, history, currentMsg, latestImageContext };
+  return { systemMsg, history, currentMsg, currentReferenceImages, latestImageContext };
 }
 
 interface ChatGptMessage {
   id: string;
   author: { role: string };
-  content: { content_type: "text"; parts: string[] };
+  content: {
+    content_type: "text" | "multimodal_text";
+    parts: Array<string | Record<string, unknown>>;
+  };
   metadata?: Record<string, unknown>;
+}
+
+interface UploadedReferenceImage {
+  fileId: string;
+  mimeType: string;
+  sizeBytes: number;
+  width?: number;
+  height?: number;
+}
+
+function parseReferenceImageDataUrl(dataUrl: string): { mimeType: string; bytes: Buffer } | null {
+  const match = IMAGE_DATA_URL_RE.exec(dataUrl.trim());
+  if (!match) return null;
+  const bytes = Buffer.from(match[2], "base64");
+  if (bytes.length === 0 || bytes.length > MAX_REFERENCE_IMAGE_BYTES) return null;
+  return { mimeType: match[1].toLowerCase(), bytes };
+}
+
+function imageDimensions(bytes: Buffer, mimeType: string): { width?: number; height?: number } {
+  if (mimeType === "image/png" && bytes.length >= 24) {
+    return { width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) };
+  }
+  if (mimeType === "image/gif" && bytes.length >= 10) {
+    return { width: bytes.readUInt16LE(6), height: bytes.readUInt16LE(8) };
+  }
+  if (mimeType === "image/webp" && bytes.length >= 30 && bytes.toString("ascii", 0, 4) === "RIFF") {
+    const kind = bytes.toString("ascii", 12, 16);
+    if (kind === "VP8X") {
+      return {
+        width: 1 + bytes.readUIntLE(24, 3),
+        height: 1 + bytes.readUIntLE(27, 3),
+      };
+    }
+  }
+  if ((mimeType === "image/jpeg" || mimeType === "image/jpg") && bytes.length >= 4) {
+    let offset = 2;
+    while (offset + 9 < bytes.length) {
+      if (bytes[offset] !== 0xff) {
+        offset++;
+        continue;
+      }
+      const marker = bytes[offset + 1];
+      const length = bytes.readUInt16BE(offset + 2);
+      if (
+        (marker >= 0xc0 && marker <= 0xc3) ||
+        (marker >= 0xc5 && marker <= 0xc7) ||
+        (marker >= 0xc9 && marker <= 0xcb) ||
+        (marker >= 0xcd && marker <= 0xcf)
+      ) {
+        return { width: bytes.readUInt16BE(offset + 7), height: bytes.readUInt16BE(offset + 5) };
+      }
+      if (length < 2) break;
+      offset += length + 2;
+    }
+  }
+  return {};
+}
+
+class ReferenceImageUploadError extends Error {
+  constructor(
+    message: string,
+    readonly status = 502
+  ) {
+    super(message);
+    this.name = "ReferenceImageUploadError";
+  }
+}
+
+async function uploadReferenceImages(
+  dataUrls: string[],
+  headers: Record<string, string>,
+  signal: AbortSignal | null | undefined
+): Promise<UploadedReferenceImage[]> {
+  if (dataUrls.length === 0) return [];
+  if (dataUrls.length > MAX_REFERENCE_IMAGES) {
+    throw new ReferenceImageUploadError(
+      `ChatGPT Web supports at most ${MAX_REFERENCE_IMAGES} reference images per generation`,
+      400
+    );
+  }
+
+  const sources = dataUrls.map(parseReferenceImageDataUrl);
+  if (sources.some((source) => !source)) {
+    throw new ReferenceImageUploadError(
+      "ChatGPT Web reference images must be PNG, JPEG, WEBP, or GIF base64 data URLs",
+      400
+    );
+  }
+  const images = sources as Array<{ mimeType: string; bytes: Buffer }>;
+  if (
+    images.reduce((total, image) => total + image.bytes.length, 0) > MAX_REFERENCE_IMAGE_TOTAL_BYTES
+  ) {
+    throw new ReferenceImageUploadError(
+      `ChatGPT Web reference images must total at most ${MAX_REFERENCE_IMAGE_TOTAL_BYTES / 1024 / 1024} MB`,
+      400
+    );
+  }
+
+  const uploaded: UploadedReferenceImage[] = [];
+  for (const [index, image] of images.entries()) {
+    const extension =
+      image.mimeType === "image/jpeg" ? "jpg" : image.mimeType.slice("image/".length);
+    const registration = await tlsFetchChatGpt(FILES_URL, {
+      method: "POST",
+      headers: { ...headers, Accept: "application/json" },
+      body: JSON.stringify({
+        file_name: `reference-${index + 1}.${extension}`,
+        file_size: image.bytes.length,
+        mime_type: image.mimeType,
+        use_case: "multimodal",
+      }),
+      timeoutMs: 60_000,
+      signal,
+    });
+    if (registration.status < 200 || registration.status >= 300) {
+      throw new ReferenceImageUploadError("ChatGPT Web could not prepare a reference image upload");
+    }
+
+    let registrationBody: { file_id?: unknown; upload_url?: unknown };
+    try {
+      registrationBody = JSON.parse(registration.text || "{}");
+    } catch {
+      throw new ReferenceImageUploadError(
+        "ChatGPT Web returned an invalid reference image upload response"
+      );
+    }
+    const fileId = typeof registrationBody.file_id === "string" ? registrationBody.file_id : null;
+    const uploadUrl =
+      typeof registrationBody.upload_url === "string" ? registrationBody.upload_url : null;
+    if (!fileId || !uploadUrl || !uploadUrl.startsWith("https://")) {
+      throw new ReferenceImageUploadError(
+        "ChatGPT Web did not return a usable reference image upload URL"
+      );
+    }
+
+    let putResponse: Response;
+    try {
+      putResponse = await fetch(uploadUrl, {
+        method: "PUT",
+        headers: { "Content-Type": image.mimeType },
+        body: image.bytes,
+        signal: signal ?? undefined,
+      });
+    } catch {
+      throw new ReferenceImageUploadError("ChatGPT Web could not upload a reference image");
+    }
+    if (!putResponse.ok) {
+      throw new ReferenceImageUploadError("ChatGPT Web rejected a reference image upload");
+    }
+
+    const confirmation = await tlsFetchChatGpt(
+      `${FILES_URL}/${encodeURIComponent(fileId)}/uploaded`,
+      {
+        method: "POST",
+        headers: { ...headers, Accept: "application/json" },
+        body: "{}",
+        timeoutMs: 60_000,
+        signal,
+      }
+    );
+    if (confirmation.status < 200 || confirmation.status >= 300) {
+      throw new ReferenceImageUploadError(
+        "ChatGPT Web could not finalize a reference image upload"
+      );
+    }
+
+    uploaded.push({
+      fileId,
+      mimeType: image.mimeType,
+      sizeBytes: image.bytes.length,
+      ...imageDimensions(image.bytes, image.mimeType),
+    });
+  }
+  return uploaded;
 }
 
 /**
@@ -903,6 +1101,7 @@ function buildConversationBody(
     thinkingEffort: ChatGptThinkingEffort | null;
     systemHints: readonly string[];
     continuation?: ChatGptImageConversationContext | null;
+    referenceImages?: UploadedReferenceImage[];
   }
 ): Record<string, unknown> {
   // Critical: do NOT send prior turns as separate `assistant` and `user`
@@ -944,10 +1143,21 @@ function buildConversationBody(
     ? "Briefly acknowledge the image result described in the system context. Do not generate, edit, or request another image."
     : parsed.currentMsg || "";
 
+  const referenceParts = (options.referenceImages || []).map((image) => ({
+    content_type: "image_asset_pointer",
+    asset_pointer: `file-service://${image.fileId}`,
+    size_bytes: image.sizeBytes,
+    ...(image.width ? { width: image.width } : {}),
+    ...(image.height ? { height: image.height } : {}),
+  }));
+
   messages.push({
     id: randomUUID(),
     author: { role: "user" },
-    content: { content_type: "text", parts: [currentUserContent] },
+    content: {
+      content_type: referenceParts.length > 0 ? "multimodal_text" : "text",
+      parts: [currentUserContent, ...referenceParts],
+    },
     ...(systemHints.length > 0 ? { metadata: { system_hints: [...systemHints] } } : {}),
   });
 
@@ -2915,7 +3125,11 @@ export class ChatGptWebExecutor extends BaseExecutor {
 
     // 4. Build conversation request
     const parsed = parseOpenAIMessages(effectiveMessages);
-    if (!parsed.currentMsg.trim() && parsed.history.length === 0) {
+    if (
+      !parsed.currentMsg.trim() &&
+      parsed.history.length === 0 &&
+      parsed.currentReferenceImages.length === 0
+    ) {
       return {
         response: errorResponse(400, "Empty user message"),
         url: CONV_URL,
@@ -2943,13 +3157,6 @@ export class ChatGptWebExecutor extends BaseExecutor {
     }
 
     const parentMessageId = continuation?.parentMessageId ?? randomUUID();
-    const cgptBody = buildConversationBody(parsed, modelSlug, parentMessageId, {
-      persistConversation,
-      thinkingEffort: resolvedModel.effort,
-      systemHints: resolveChatGptSystemHints(model),
-      continuation,
-    });
-
     const headers: Record<string, string> = {
       ...browserHeaders(),
       ...oaiHeaders(sessionId, deviceId),
@@ -2965,6 +3172,36 @@ export class ChatGptWebExecutor extends BaseExecutor {
       headers["openai-sentinel-chat-requirements-prepare-token"] = reqs.prepare_token;
     if (proofToken) headers["openai-sentinel-proof-token"] = proofToken;
     if (turnstileToken) headers["openai-sentinel-turnstile-token"] = turnstileToken;
+
+    let uploadedReferenceImages: UploadedReferenceImage[];
+    try {
+      uploadedReferenceImages = await uploadReferenceImages(
+        parsed.currentReferenceImages,
+        headers,
+        signal
+      );
+    } catch (err) {
+      const status = err instanceof ReferenceImageUploadError ? err.status : 502;
+      const message =
+        err instanceof ReferenceImageUploadError
+          ? err.message
+          : "ChatGPT Web could not upload a reference image";
+      log?.warn?.("CGPT-WEB", message);
+      return {
+        response: errorResponse(status, message),
+        url: FILES_URL,
+        headers,
+        transformedBody: body,
+      };
+    }
+
+    const cgptBody = buildConversationBody(parsed, modelSlug, parentMessageId, {
+      persistConversation,
+      thinkingEffort: resolvedModel.effort,
+      systemHints: resolveChatGptSystemHints(model),
+      continuation,
+      referenceImages: uploadedReferenceImages,
+    });
 
     log?.info?.("CGPT-WEB", `Conversation request → ${modelSlug} (pow=${!!proofToken})`);
 
