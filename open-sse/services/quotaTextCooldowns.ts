@@ -41,7 +41,9 @@ export function isSubscriptionQuotaText(lower: string): boolean {
 export function isChatGptImageQuotaText(lower: string): boolean {
   return (
     lower.includes("plus plan limit for image generation") ||
-    lower.includes("plus plan limit for image generations")
+    lower.includes("plus plan limit for image generations") ||
+    lower.includes("free plan limit for image generation") ||
+    lower.includes("free plan limit for image generations")
   );
 }
 

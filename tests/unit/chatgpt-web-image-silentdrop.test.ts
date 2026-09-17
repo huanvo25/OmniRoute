@@ -18,6 +18,7 @@ process.env.DATA_DIR = mkdtempSync(join(tmpdir(), "omniroute-cgptweb-silentdrop-
 const { detectImageResolutionFailure } = await import("../../open-sse/executors/chatgpt-web.ts");
 const { buildChatGptWebImageRequestArtifact, handleChatGptWebImageGeneration } =
   await import("../../open-sse/handlers/imageGeneration/providers/chatgptWeb.ts");
+const { getDbInstance } = await import("../../src/lib/db/core.ts");
 
 function fakeExecutor(jsonBody: object, status = 200) {
   return {
@@ -95,6 +96,58 @@ test("handler maps the ChatGPT Plus image-generation limit to 429", async () => 
   assert.equal(res.success, false);
   assert.equal(res.status, 429);
   assert.match(res.error, /Plus plan limit for image generations/i);
+  assert.equal(res.retrySafe, true);
+});
+
+test("handler maps the ChatGPT Free image-generation limit to 429", async () => {
+  const res = await handleChatGptWebImageGeneration({
+    ...baseArgs,
+    executorFactory: () =>
+      fakeExecutor({
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content:
+                "You've hit the Free plan limit for image generations requests. You can create more images when the limit resets in 6 minutes.",
+            },
+          },
+        ],
+      }),
+  });
+
+  assert.equal(res.success, false);
+  assert.equal(res.status, 429);
+  assert.equal(res.retrySafe, true);
+  assert.match(String(res.error), /Free plan limit/i);
+});
+
+test("handler marks a quota error after an earlier image turn as unsafe to replay", async () => {
+  const imageUrl = "/v1/chatgpt-web/image/abcdef0123456789";
+  let call = 0;
+  const res = await handleChatGptWebImageGeneration({
+    ...baseArgs,
+    body: { prompt: "a kitten", n: 2 },
+    executorFactory: () => ({
+      execute: async () => {
+        call += 1;
+        const content =
+          call === 1
+            ? `![image](${imageUrl})`
+            : "You've hit the Plus plan limit for image generations requests.";
+        return {
+          response: new Response(JSON.stringify({ choices: [{ message: { content } }] }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+        };
+      },
+    }),
+  });
+
+  assert.equal(res.success, false);
+  assert.equal(res.status, 429);
+  assert.equal(res.retrySafe, false);
 });
 
 test("handler returns success when the executor produced image markdown", async () => {
@@ -109,6 +162,54 @@ test("handler returns success when the executor produced image markdown", async 
   assert.equal(res.success, true);
   assert.equal(res.data.data.length, 1);
   assert.equal(res.data.data[0].url, url);
+});
+
+test("handler attributes ChatGPT Web image call logs to the selected connection", async () => {
+  const connectionId = "chatgpt-web-image-log-connection";
+  const url = "/v1/chatgpt-web/image/abcdef0123456789";
+  const res = await handleChatGptWebImageGeneration({
+    ...baseArgs,
+    credentials: { apiKey: "sess-cookie", connectionId },
+    executorFactory: () =>
+      fakeExecutor({
+        choices: [{ message: { role: "assistant", content: `![image](${url})` } }],
+      }),
+  });
+
+  assert.equal(res.success, true);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const row = getDbInstance()
+    .prepare("SELECT connection_id, status FROM call_logs WHERE connection_id = ?")
+    .get(connectionId) as { connection_id?: string; status?: number } | undefined;
+  assert.equal(row?.connection_id, connectionId);
+  assert.equal(Number(row?.status), 200);
+});
+
+test("handler attributes failed ChatGPT Web image calls to the selected connection", async () => {
+  const connectionId = "chatgpt-web-image-error-log-connection";
+  const res = await handleChatGptWebImageGeneration({
+    ...baseArgs,
+    credentials: { apiKey: "sess-cookie", connectionId },
+    executorFactory: () =>
+      fakeExecutor({
+        choices: [
+          {
+            message: {
+              role: "assistant",
+              content: "You've hit the Plus plan limit for image generations requests.",
+            },
+          },
+        ],
+      }),
+  });
+
+  assert.equal(res.success, false);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const row = getDbInstance()
+    .prepare("SELECT connection_id, status FROM call_logs WHERE connection_id = ?")
+    .get(connectionId) as { connection_id?: string; status?: number } | undefined;
+  assert.equal(row?.connection_id, connectionId);
+  assert.equal(Number(row?.status), 429);
 });
 
 test("handler forwards the complete prompt beyond the old 500-character preview boundary", async () => {

@@ -27,7 +27,11 @@ import { attachOmniRouteMetaHeaders } from "@/domain/omnirouteResponseMeta";
 import { calculateModalCost } from "@/lib/usage/costCalculator";
 import { generateRequestId } from "@/shared/utils/requestId";
 import { getSpecialtyModelsResponse } from "@/app/api/v1/_shared/specialtyCatalog";
-import { runImageGenerationAccountLoop } from "@/lib/images/imageAccountFallback";
+import {
+  runImageGenerationAccountLoop,
+  shouldCoolChatGptWebImageAccount,
+  shouldRotateChatGptWebImageAccount,
+} from "@/lib/images/imageAccountFallback";
 
 export const dynamic = "force-dynamic";
 
@@ -90,6 +94,7 @@ function publicBaseUrlHeaders(headers: Headers): Record<string, string> {
 }
 
 async function postHandler(request, context) {
+  const requestId = request.headers.get("x-request-id")?.trim() || generateRequestId();
   let rawBody;
   try {
     rawBody = await request.json();
@@ -103,6 +108,10 @@ async function postHandler(request, context) {
     return errorResponse(HTTP_STATUS.BAD_REQUEST, validation.error.message);
   }
   const body = validation.data;
+  // Private server-side correlation only. Provider handlers persist this in
+  // call_logs so a gen-image candidate can be joined to its exact OmniRoute
+  // attempt without exposing account/connection identifiers to the client.
+  body.__omnirouteCorrelationId = requestId;
   const startTime = Date.now();
 
   // Enforce API key policies (model restrictions + budget limits)
@@ -214,12 +223,16 @@ async function postHandler(request, context) {
       execute: executeWithCredentials,
       shouldRotate: (failedResult, selectedCredentials) =>
         providerConfig?.format === "chatgpt-web" &&
-        failedResult.status === HTTP_STATUS.RATE_LIMITED &&
+        shouldRotateChatGptWebImageAccount(failedResult) &&
+        Boolean(selectedCredentials?.connectionId),
+      shouldMarkUnavailable: (failedResult, selectedCredentials) =>
+        providerConfig?.format === "chatgpt-web" &&
+        shouldCoolChatGptWebImageAccount(failedResult) &&
         Boolean(selectedCredentials?.connectionId),
       markUnavailable: (selectedCredentials, failedResult) =>
         markAccountUnavailable(
           selectedCredentials.connectionId as string,
-          HTTP_STATUS.RATE_LIMITED,
+          failedResult.status ?? HTTP_STATUS.BAD_GATEWAY,
           typeof failedResult.error === "string"
             ? failedResult.error
             : JSON.stringify(failedResult.error),
@@ -260,8 +273,11 @@ async function postHandler(request, context) {
       model: body.model,
       costUsd,
       latencyMs: Date.now() - startTime,
-      requestId: generateRequestId(),
+      requestId,
     });
+    if ((result as any).upstreamConversationId) {
+      headers.set("X-ChatGPT-Conversation-Id", String((result as any).upstreamConversationId));
+    }
     return new Response(JSON.stringify((result as { data: unknown }).data), {
       status: 200,
       headers,
@@ -269,9 +285,16 @@ async function postHandler(request, context) {
   }
 
   const errorPayload = toJsonErrorPayload((result as any).error, "Image generation provider error");
+  const errorHeaders = new Headers({
+    "Content-Type": "application/json",
+    "X-OmniRoute-Request-Id": requestId,
+  });
+  if ((result as any).upstreamConversationId) {
+    errorHeaders.set("X-ChatGPT-Conversation-Id", String((result as any).upstreamConversationId));
+  }
   return new Response(JSON.stringify(errorPayload), {
     status: (result as any).status,
-    headers: { "Content-Type": "application/json" },
+    headers: errorHeaders,
   });
 }
 

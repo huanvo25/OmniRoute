@@ -98,6 +98,10 @@ ENV OMNIROUTE_MITM_STUB=1
 ARG OMNIROUTE_BUILD_MEMORY_MB=4096
 ENV NODE_OPTIONS="--max-old-space-size=${OMNIROUTE_BUILD_MEMORY_MB}"
 
+# Build-only concurrency cap for memory-constrained CI runners.
+ARG OMNIROUTE_BUILD_CPUS=0
+ENV OMNIROUTE_BUILD_CPUS=${OMNIROUTE_BUILD_CPUS}
+
 COPY . ./
 RUN --mount=type=cache,id=next-cache,target=/app/.build/next/cache \
   mkdir -p /app/data && npm run build

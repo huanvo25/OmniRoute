@@ -6,6 +6,7 @@ import { mitmManagerAliasFor } from "./scripts/build/mitm-stub-flag.mjs";
 
 const withNextIntl = createNextIntlPlugin("./src/i18n/request.ts");
 const distDir = process.env.NEXT_DIST_DIR || ".build/next";
+const buildWorkerCount = Number(process.env.OMNIROUTE_BUILD_CPUS || 0);
 const projectRoot = dirname(fileURLToPath(import.meta.url));
 const scriptSrc =
   process.env.NODE_ENV === "development"
@@ -148,6 +149,7 @@ const nextConfig = {
   // accept for image-bearing requests; tune via env if a deployment needs
   // more.
   experimental: {
+    ...(buildWorkerCount > 0 ? { cpus: buildWorkerCount } : {}),
     serverActions: {
       bodySizeLimit: process.env.OMNIROUTE_SERVER_ACTIONS_BODY_LIMIT || "50mb",
     },
