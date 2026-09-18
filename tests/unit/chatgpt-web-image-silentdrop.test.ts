@@ -16,9 +16,11 @@ import { join } from "node:path";
 process.env.DATA_DIR = mkdtempSync(join(tmpdir(), "omniroute-cgptweb-silentdrop-"));
 
 const { detectImageResolutionFailure } = await import("../../open-sse/executors/chatgpt-web.ts");
-const { buildChatGptWebImageRequestArtifact, handleChatGptWebImageGeneration } = await import(
-  "../../open-sse/handlers/imageGeneration/providers/chatgptWeb.ts"
-);
+const {
+  buildChatGptWebImageRequestArtifact,
+  handleChatGptWebImageGeneration,
+  isRetryableChatGptWebImageAccountFailure,
+} = await import("../../open-sse/handlers/imageGeneration/providers/chatgptWeb.ts");
 
 function fakeExecutor(jsonBody: object, status = 200) {
   return {
@@ -46,6 +48,41 @@ test("detectImageResolutionFailure: true only when a pointer existed but none re
   assert.equal(detectImageResolutionFailure(2, 0), true);
   assert.equal(detectImageResolutionFailure(0, 0), false); // no image at all
   assert.equal(detectImageResolutionFailure(1, 1), false); // resolved fine
+});
+
+test("ChatGPT Web image account failures rotate only for account-scoped errors", () => {
+  assert.equal(
+    isRetryableChatGptWebImageAccountFailure(
+      403,
+      "ChatGPT blocked the request (Sentinel/Turnstile required)"
+    ),
+    true
+  );
+  assert.equal(
+    isRetryableChatGptWebImageAccountFailure(
+      502,
+      "ChatGPT Web could not prepare a reference image upload"
+    ),
+    true
+  );
+  assert.equal(
+    isRetryableChatGptWebImageAccountFailure(502, "dial tcp: network is unreachable"),
+    false
+  );
+});
+
+test("handler marks Sentinel and reference-upload failures retryable", async () => {
+  for (const [status, message] of [
+    [403, "ChatGPT blocked the request (Sentinel/Turnstile required)"],
+    [502, "ChatGPT Web could not prepare a reference image upload"],
+  ] as const) {
+    const res = await handleChatGptWebImageGeneration({
+      ...baseArgs,
+      executorFactory: () => fakeExecutor({ error: { message } }, status),
+    });
+    assert.equal(res.success, false);
+    assert.equal(res.retryable, true);
+  }
 });
 
 test("handler surfaces a specific 502 when the image was generated but not retrievable", async () => {

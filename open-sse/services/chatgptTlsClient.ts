@@ -38,7 +38,15 @@ export const tlsClientModule = createTlsClientModule({
 export const tlsFetchChatGpt = (
   url: string,
   options: TlsFetchOptions = {}
-): Promise<TlsFetchResult> => tlsClientModule.tlsFetch(url, options);
+): Promise<TlsFetchResult> =>
+  tlsClientModule.tlsFetch(url, {
+    ...options,
+    // chatgpt.com publishes AAAA records, while many production Docker hosts
+    // (including the supported single-host deployment) have no IPv6 default
+    // route. The native Go transport can otherwise select an unreachable AAAA
+    // address and fail without reaching the healthy IPv4 endpoints.
+    disableIpv6: true,
+  });
 export const __tlsFetchStreamingForTesting = tlsClientModule.__tlsFetchStreamingForTesting;
 
 export const __setTlsFetchOverrideForTesting = tlsClientModule.__setTlsFetchOverrideForTesting;

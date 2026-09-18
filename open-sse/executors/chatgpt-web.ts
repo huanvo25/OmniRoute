@@ -944,7 +944,10 @@ async function uploadReferenceImages(
       signal,
     });
     if (registration.status < 200 || registration.status >= 300) {
-      throw new ReferenceImageUploadError("ChatGPT Web could not prepare a reference image upload");
+      throw new ReferenceImageUploadError(
+        `ChatGPT Web could not prepare a reference image upload (HTTP ${registration.status})`,
+        registration.status >= 400 && registration.status < 600 ? registration.status : 502
+      );
     }
 
     let registrationBody: {
@@ -1016,7 +1019,8 @@ async function uploadReferenceImages(
     );
     if (confirmation.status < 200 || confirmation.status >= 300) {
       throw new ReferenceImageUploadError(
-        "ChatGPT Web could not finalize a reference image upload"
+        `ChatGPT Web could not finalize a reference image upload (HTTP ${confirmation.status})`,
+        confirmation.status >= 400 && confirmation.status < 600 ? confirmation.status : 502
       );
     }
 
@@ -2878,6 +2882,15 @@ async function pollForAsyncImage(
       let newest: { pointers: ImagePointerRef[]; at: number } | null = null;
       for (const node of Object.values(mapping)) {
         const message = node?.message;
+        // Conversation mappings include the original user message. Its
+        // multimodal parts are the uploaded references, and ChatGPT may expose
+        // them through a different pointer scheme than the file-service IDs we
+        // recorded during upload. Selecting that newest user node makes the
+        // image endpoint return Hình 1/Hình 2 byte-for-byte instead of the
+        // generated result. Async image results are emitted by tool/assistant
+        // messages, never by the user message, so exclude user-authored nodes
+        // before considering pointers.
+        if (message?.author?.role === "user") continue;
         const parts = message?.content?.parts;
         if (!Array.isArray(parts)) continue;
         const pointers = extractImagePointers(parts).map((pointer) => ({

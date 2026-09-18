@@ -50,11 +50,26 @@ function isCredentialSentinel(credentials: any): boolean {
   return Boolean(credentials?.allRateLimited || credentials?.allExpired);
 }
 
-const CHATGPT_WEB_IMAGE_QUOTA_RE = /(?:plus|free) plan limit for image generations?\s+requests?/i;
+const CHATGPT_WEB_SENTINEL_RE = /sentinel|turnstile/i;
 
 function isChatGptWebImageQuotaFailure(provider: string, result: ImageGenerationResult): boolean {
   if (provider !== "chatgpt-web" || Number(result.status) !== 429) return false;
-  return CHATGPT_WEB_IMAGE_QUOTA_RE.test(String(result.error || ""));
+  // Registration/upload endpoints can return a plain 429 without the image
+  // quota sentence used by the conversation endpoint. It is still an account
+  // cooldown and must be persisted instead of immediately selecting the same
+  // connection for the next batch item.
+  return true;
+}
+
+function isChatGptWebSentinelFailure(
+  provider: string,
+  result: ImageGenerationResult
+): boolean {
+  return (
+    provider === "chatgpt-web" &&
+    Number(result.status) === 403 &&
+    CHATGPT_WEB_SENTINEL_RE.test(String(result.error || ""))
+  );
 }
 
 async function defaultSelectNextCredentials(
@@ -119,15 +134,34 @@ export async function executeImageWithCredentialFallback({
     lastResult = await execute(currentCredentials);
     const isAuthFailure = Number(lastResult.status) === 401 || lastResult.retryable === true;
     const isQuotaFailure = isChatGptWebImageQuotaFailure(provider, lastResult);
-    if (lastResult.success || (!isAuthFailure && !isQuotaFailure) || !connectionId) {
+    const isSentinelFailure = isChatGptWebSentinelFailure(provider, lastResult);
+    const isChatGptWebAccountFailure =
+      provider === "chatgpt-web" &&
+      lastResult.retryable === true &&
+      Number(lastResult.status) !== 401;
+    if (
+      lastResult.success ||
+      (!isAuthFailure && !isQuotaFailure && !isSentinelFailure) ||
+      !connectionId
+    ) {
       return { credentials: lastCredentials, result: lastResult };
     }
 
-    if (isQuotaFailure) {
+    if (isQuotaFailure || isSentinelFailure || isChatGptWebAccountFailure) {
       await markAccountUnavailable(
         connectionId,
-        429,
-        String(lastResult.error || "ChatGPT Web image quota exhausted"),
+        // Sentinel is an account-scoped, temporary WAF block. Classify it as
+        // a rate-limit cooldown so the connection stays excluded until the
+        // persisted timer expires instead of being selected again immediately.
+        isSentinelFailure || Number(lastResult.status) === 403
+          ? 429
+          : Number(lastResult.status) || 502,
+        String(
+          lastResult.error ||
+            (isSentinelFailure
+              ? "ChatGPT Web Sentinel/Turnstile blocked this account"
+              : "ChatGPT Web image quota exhausted")
+        ),
         provider,
         requestedModel
       );

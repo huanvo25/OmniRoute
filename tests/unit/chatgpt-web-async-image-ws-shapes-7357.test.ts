@@ -256,6 +256,7 @@ class EmptyCloseWebSocket extends EventEmitter {
 
 const STALE_POINTER = "file-service://file-stale-7357";
 const NEWEST_POINTER = "file-service://file-newest-7357";
+const ECHOED_REFERENCE_POINTER = "sediment://file-reference-alias-7357";
 
 test(
   "#7357: conversation-poll fallback recovers the image and prefers the newest " +
@@ -270,6 +271,7 @@ test(
     (globalThis as Record<string, unknown>).WebSocket = EmptyCloseWebSocket;
 
     let conversationPollCalls = 0;
+    const resolvedFileIds: string[] = [];
 
     __setTlsFetchOverrideForTesting(async (url, opts = {}) => {
       const u = String(url);
@@ -321,7 +323,9 @@ test(
       // GET /backend-api/conversation/<id> — the conversation-poll fallback
       // fetchConversationDetail() hits once the websocket yields nothing.
       // The mapping carries TWO tool messages with image pointers at
-      // different create_time — the fallback must pick the newer one.
+      // different create_time and a still-newer user-authored reference
+      // pointer. The fallback must pick the newest generated tool result, not
+      // the uploaded input echoed under a different pointer scheme.
       if (
         u === `https://chatgpt.com/backend-api/conversation/${CONVERSATION_ID}` &&
         method === "GET"
@@ -370,6 +374,26 @@ test(
                   create_time: 2000,
                 },
               },
+              "node-reference-echo": {
+                message: {
+                  id: "user-reference-echo",
+                  author: { role: "user" },
+                  content: {
+                    content_type: "multimodal_text",
+                    parts: [
+                      "generate an image of a kitten",
+                      {
+                        content_type: "image_asset_pointer",
+                        asset_pointer: ECHOED_REFERENCE_POINTER,
+                        width: 1024,
+                        height: 1024,
+                      },
+                    ],
+                  },
+                  status: "finished_successfully",
+                  create_time: 3000,
+                },
+              },
             },
           }),
           body: null,
@@ -377,6 +401,7 @@ test(
       }
       if (u.match(/\/backend-api\/files\/[^/]+\/download/)) {
         const fileId = u.match(/\/backend-api\/files\/([^/]+)\/download/)?.[1] ?? "unknown";
+        resolvedFileIds.push(fileId);
         return {
           status: 200,
           headers: makeHeaders({ "Content-Type": "application/json" }),
@@ -433,6 +458,11 @@ test(
         json.x_image_resolution_failed,
         undefined,
         "resolution succeeded — no unresolved-pointer flag expected"
+      );
+      assert.deepEqual(
+        resolvedFileIds,
+        ["file-newest-7357"],
+        "conversation fallback must resolve the generated tool image, never the uploaded user reference"
       );
     } finally {
       __setTlsFetchOverrideForTesting(null);

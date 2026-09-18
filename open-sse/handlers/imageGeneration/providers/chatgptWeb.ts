@@ -14,6 +14,22 @@ const MAX_REFERENCE_IMAGES = 4;
 const MAX_REFERENCE_IMAGE_BYTES = 10 * 1024 * 1024;
 const MAX_REFERENCE_IMAGE_TOTAL_BYTES = 20 * 1024 * 1024;
 const IMAGE_DATA_URL_RE = /^data:(image\/(?:png|jpe?g|webp|gif));base64,([A-Za-z0-9+/]+={0,2})$/i;
+const CHATGPT_WEB_SENTINEL_RE = /sentinel|turnstile/i;
+const CHATGPT_WEB_REFERENCE_UPLOAD_RE =
+  /could not (?:prepare|upload|finalize) a reference image upload|rejected a reference image upload/i;
+
+export function isRetryableChatGptWebImageAccountFailure(
+  status: number,
+  error: unknown
+): boolean {
+  const text = String(error || "");
+  if (status === 401 || status === 429) return true;
+  if (status === 403 && CHATGPT_WEB_SENTINEL_RE.test(text)) return true;
+  return (
+    (status === 401 || status === 403 || status === 429 || status >= 500) &&
+    CHATGPT_WEB_REFERENCE_UPLOAD_RE.test(text)
+  );
+}
 
 export function extractChatGptWebReferenceImages(body: Record<string, unknown>): {
   images: string[];
@@ -222,6 +238,10 @@ export async function handleChatGptWebImageGeneration({
         startTime,
         error: responseText,
         requestBody,
+        retryable: isRetryableChatGptWebImageAccountFailure(
+          result.response.status,
+          responseText
+        ),
       });
     }
 

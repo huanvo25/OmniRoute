@@ -62,6 +62,8 @@ export interface TlsFetchOptions {
   streamEofSymbol?: string;
   byteResponse?: boolean;
   proxyUrl?: string;
+  /** Force the native tls-client transport to avoid unusable IPv6 routes. */
+  disableIpv6?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -682,7 +684,7 @@ export function resolveProxyUrl(domain: string, perCall: string | undefined): st
 // Factory — creates provider-specific tlsFetch + helpers
 // ---------------------------------------------------------------------------
 
-const CLEANUP_VARIANTS = {
+const _CLEANUP_VARIANTS = {
   A: cleanupTempPathSubstring,
   B: cleanupTempPathDirname,
 } as const;
@@ -881,6 +883,7 @@ export function createTlsClientModule(config: TlsClientConfig): TlsClientModule 
       followRedirects: true,
       withRandomTLSExtensionOrder: true,
       proxyUrl: resolvedProxyUrl,
+      disableIPV6: options.disableIpv6 === true,
     };
 
     requestOptions.isByteResponse = options.byteResponse === true;

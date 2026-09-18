@@ -85,6 +85,7 @@ describe("chatgptTlsClient — proxy plumbing (#2022)", async () => {
     expect(r.status).toBe(200);
     expect(observedUrl).toBe("https://chatgpt.com/api/auth/session");
     expect((observedOpts as { proxyUrl?: string }).proxyUrl).toBe("http://per-call:0/");
+    expect((observedOpts as { disableIpv6?: boolean }).disableIpv6).toBe(true);
   });
 
   it("TlsFetchOptions accepts proxyUrl typed as string", () => {
