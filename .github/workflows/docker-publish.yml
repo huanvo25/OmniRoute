@@ -33,6 +33,8 @@ permissions:
 
 jobs:
   prepare:
+    # This publisher targets the upstream Docker Hub namespace; forks use build-fork.yml.
+    if: github.repository == 'diegosouzapw/OmniRoute'
     name: Resolve Docker release metadata
     runs-on: ubuntu-latest
     outputs:
