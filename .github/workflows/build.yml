@@ -2,8 +2,15 @@ name: Build App
 
 on:
   workflow_dispatch:
+    inputs:
+      upload_artifact:
+        description: "Archive build output (large; production images are published separately)"
+        type: boolean
+        default: false
   push:
     branches: ["**"]
+    paths-ignore:
+      - ".github/workflows/**"
 
 permissions:
   contents: read
@@ -46,12 +53,14 @@ jobs:
           OMNIROUTE_USE_TURBOPACK: "1"
 
       - name: Archive build outputs
+        if: github.event_name == 'workflow_dispatch' && inputs.upload_artifact
         run: |
           tar -czf omniroute-build.tar.gz .build dist
 
       - name: Upload build artifact
+        if: github.event_name == 'workflow_dispatch' && inputs.upload_artifact
         uses: actions/upload-artifact@v4
         with:
           name: omniroute-build
           path: omniroute-build.tar.gz
-          retention-days: 7
+          retention-days: 1
